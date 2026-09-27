@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grokbot-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUN", "class_name": "Run" },
+      { "name": "BUDGET", "class_name": "Budget" }
+    ]
+  },
+  // /mcp 全体の上限（ロケーション単位・結果整合。ask の正確な上限は Budget DO が担う）
+  "ratelimits": [{ "name": "MCP_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Run"] },
+    { "tag": "v2", "new_sqlite_classes": ["Budget"] }
+  ],
+  "vars": {
+    "MAX_WAIT_SECONDS": "180",
+    "CALLBACK_TTL_SECONDS": "3600",
+    "RUN_RETENTION_SECONDS": "604800",
+    "ASK_PER_MINUTE_LIMIT": "10",
+    "ASK_DAILY_LIMIT": "200",
+    "COST_KILL_SWITCH": "0"
+  },
+  "observability": { "enabled": true }
+  // secrets: CURSOR_WEBHOOK_URL, CURSOR_WEBHOOK_API_KEY, MCP_API_KEY, CALLBACK_SIGNING_SECRET
+}
