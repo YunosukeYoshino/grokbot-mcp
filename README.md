@@ -17,6 +17,7 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 | `src/run.ts` | `Run` DO。run の状態、待機、TTL / retention の alarm |
 | `src/budget.ts` | `Budget` DO。`ask_grokbot` の分間・日次の上限カウント |
 | `src/config.ts` | vars の検証（不正なら fail-closed） |
+| `test/bridge.test.ts` | Workers ランタイム上の統合テスト（vitest-pool-workers） |
 
 ## MCP ツール（`POST /mcp`、`Authorization: Bearer $MCP_API_KEY` または `X-API-Key: $MCP_API_KEY`）
 
@@ -47,7 +48,21 @@ wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32
 bun run deploy
 ```
 
-Grok Bot の routine の Instructions には「答えを `{"answer": "..."}` として `callback_url` に POST する」旨を書く。
+Grok Bot の routine（トリガー: Webhook）を作り、POST 先と Key を `CURSOR_WEBHOOK_URL` / `CURSOR_WEBHOOK_API_KEY` に入れる。Instructions の例:
+
+```text
+Webhook で起動したら、ペイロードを読む。test: true / 空ボディ / 依頼文が無いものは無視する。
+message を依頼文として扱い、回答を作る。ペイロードの run_id をそのままエコーし、新しい ID を発行しない。
+1. callback_url に JSON を POST する（Content-Type: application/json、User-Agent: grokbot-bridge-callback/1。
+   Authorization ヘッダは付けず、着信 webhook のキーは転送しない）。
+   ボディ: {"ok": true, "run_id": "<着信UUID>", "answer": "<回答全文>"}
+2. callback_url には疎通確認・test の POST を送らない。最初の POST が必ず回答全文であること。
+3. 再送は通信エラーまたは 5xx のときだけ 1 回。4xx は再送しない。
+4. このチャットには「回答: <要約>」「run_id: …」「callback: HTTP <ステータス>」だけを投稿する。
+```
+
+- User-Agent を明示する。Python-urllib 既定の UA は Cloudflare に 1010（403）で弾かれ、Worker まで届かない。
+- 最初に届いた callback で回答が確定する（2 回目以降は 409）。probe を送ると probe の内容が回答になる。
 
 ## MCP クライアントの接続
 
@@ -111,3 +126,7 @@ vars が数値として不正なら `/mcp` と callback は 503 `misconfigured` 
 手動で設定しておくもの:
 - Cloudflare ダッシュボード → Billing → Billable Usage → 予算アラート（通知のみで停止はしない）
 - Cursor 側の利用上限（spend limit）
+
+## License
+
+[MIT](LICENSE)。脆弱性の報告は [SECURITY.md](SECURITY.md) を参照。

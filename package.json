@@ -1,5 +1,12 @@
 {
   "name": "grokbot-bridge",
+  "version": "0.1.0",
+  "description": "Cloudflare Worker that turns Grok Bot (Cursor automation webhook) callbacks into synchronous MCP tool results",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YunosukeYoshino/grokbot-bridge.git"
+  },
   "private": true,
   "type": "module",
   "scripts": {
