@@ -83,7 +83,7 @@ function notFound(runId: string) {
 }
 
 function createServer(env: Env, cfg: Config, baseUrl: string) {
-  const server = new McpServer({ name: "grokbot-bridge", version: "0.1.0" });
+  const server = new McpServer({ name: "grokbot-mcp", version: "0.1.0" });
 
   server.registerTool(
     "ask_grokbot",

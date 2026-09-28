@@ -1,10 +1,10 @@
 <div align="center">
 
-# grokbot-bridge
+# grokbot-mcp
 
 Grok Bot（Cursor automation の webhook）の非同期 callback を、MCP ツールの同期的な結果に変換する Cloudflare Worker。
 
-[![CI](https://github.com/YunosukeYoshino/grokbot-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/YunosukeYoshino/grokbot-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/YunosukeYoshino/grokbot-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/YunosukeYoshino/grokbot-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -15,7 +15,7 @@ Grok Bot（Cursor automation の webhook）の非同期 callback を、MCP ツ�
 [![Vitest](https://img.shields.io/badge/Vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Bun](https://img.shields.io/badge/Bun-000000?logo=bun&logoColor=white)](https://bun.sh/)
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YunosukeYoshino/grokbot-bridge)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YunosukeYoshino/grokbot-mcp)
 
 </div>
 
