@@ -26,5 +26,21 @@
     "typescript": "^5",
     "vitest": "^4.1.0",
     "wrangler": "^4.135.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CURSOR_WEBHOOK_URL": {
+        "description": "Grok Bot の routine（トリガー: Webhook）の **POST 先** URL（`https://api2.cursor.sh/automations/webhook/...`）。"
+      },
+      "CURSOR_WEBHOOK_API_KEY": {
+        "description": "同じ routine の **キー**（`crsr_...`）。Bearer として webhook に付ける。"
+      },
+      "MCP_API_KEY": {
+        "description": "MCP クライアントが `/mcp` に付ける API キー。`openssl rand -hex 32` で生成する。"
+      },
+      "CALLBACK_SIGNING_SECRET": {
+        "description": "callback URL の HMAC 署名用 secret。`openssl rand -hex 32` で生成する（`MCP_API_KEY` とは別の値）。"
+      }
+    }
   }
 }

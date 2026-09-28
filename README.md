@@ -1,5 +1,7 @@
 # grokbot-bridge
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YunosukeYoshino/grokbot-bridge)
+
 Grok Bot（Cursor automation の webhook）の非同期 callback を、MCP ツールの同期的な結果に変換する Cloudflare Worker。
 
 ```
@@ -38,6 +40,10 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 403 `invalid_token`、400 `invalid_json` / `body_must_be_object` / `run_id_mismatch`、404 不明な run、405 POST 以外、409 `already_answered` / `already_cancelled`、410 期限切れ、413 256KB 超、503 `callback_secret_not_configured` / `misconfigured`。
 
 ## セットアップ
+
+**ボタンで:** 上の Deploy to Cloudflare を押すと、リポジトリが自分の GitHub / GitLab に複製され、Durable Object 込みでデプロイされる。設定画面で 4 つの secret（下記）を入力する。
+
+**CLI で:**
 
 ```sh
 bun install
