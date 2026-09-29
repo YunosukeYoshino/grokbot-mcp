@@ -2,7 +2,9 @@
 
 # grokbot-mcp
 
-Grok Bot（Cursor automation の webhook）の非同期 callback を、MCP ツールの同期的な結果に変換する Cloudflare Worker。
+**English** | [日本語](README.ja.md)
+
+A Cloudflare Worker that turns Grok Bot's (Cursor automation webhook) async callback into a synchronous MCP tool result.
 
 [![CI](https://github.com/YunosukeYoshino/grokbot-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/YunosukeYoshino/grokbot-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -24,41 +26,41 @@ MCP client ─ask_grokbot→ Worker ─POST {message, run_id, callback_url}→ G
 MCP client ←answer_text─ Worker ←POST /callbacks/{run_id}/{token} {answer}─ Grok Bot
 ```
 
-## 構成（Structure）
+## Structure
 
-run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ上、状態は DO storage。
+One run = one `Run` Durable Object. Waiters live in DO memory; state lives in DO storage.
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `src/index.ts` | Worker 入口。MCP ツール、callback の認証・受信、webhook 送信 |
-| `src/run.ts` | `Run` DO。run の状態、待機、TTL / retention の alarm |
-| `src/budget.ts` | `Budget` DO。`ask_grokbot` の分間・日次の上限カウント |
-| `src/config.ts` | vars の検証（不正なら fail-closed） |
-| `test/bridge.test.ts` | Workers ランタイム上の統合テスト（vitest-pool-workers） |
+| `src/index.ts` | Worker entry. MCP tools, callback auth and intake, webhook dispatch |
+| `src/run.ts` | `Run` DO. Run state, waiting, TTL / retention alarms |
+| `src/budget.ts` | `Budget` DO. Per-minute and daily counters for `ask_grokbot` |
+| `src/config.ts` | Validation of vars (fail-closed when invalid) |
+| `test/bridge.test.ts` | Integration tests on the Workers runtime (vitest-pool-workers) |
 
-## MCP ツール（`POST /mcp`、`Authorization: Bearer $MCP_API_KEY` または `X-API-Key: $MCP_API_KEY`）
+## MCP tools (`POST /mcp`, `Authorization: Bearer $MCP_API_KEY` or `X-API-Key: $MCP_API_KEY`)
 
-| Tool | 用途 |
+| Tool | Purpose |
 |---|---|
-| `ask_grokbot(message, wait_seconds=60)` | webhook に送信し callback を待つ。webhook 失敗時は `webhook_failed` |
-| `wait_for_grokbot_answer(run_id, timeout_seconds=60)` | pending の続きを待つ |
-| `get_grokbot_run(run_id)` | run を取得 |
-| `cancel_run(run_id)` | pending を取り消す |
+| `ask_grokbot(message, wait_seconds=60)` | Send to the webhook and wait for the callback. Returns `webhook_failed` if the webhook fails |
+| `wait_for_grokbot_answer(run_id, timeout_seconds=60)` | Keep waiting on a pending run |
+| `get_grokbot_run(run_id)` | Fetch a run |
+| `cancel_run(run_id)` | Cancel a pending run |
 
-`status`: `pending` / `answered` / `cancelled` / `expired`。待機は `MAX_WAIT_SECONDS`（上限 300）で打ち切り。`/mcp` 全体は `MCP_RATE_LIMITER`（60 回/分、ロケーション単位）で 429。
+`status`: `pending` / `answered` / `cancelled` / `expired`. Waits are capped by `MAX_WAIT_SECONDS` (max 300). All of `/mcp` is limited by `MCP_RATE_LIMITER` (60 req/min, per location) and returns 429 beyond that.
 
-## Callback（Grok Bot → Worker）
+## Callback (Grok Bot → Worker)
 
-`callback_url` は `/callbacks/{run_id}/{token}`、token は `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`。Worker が body を読む前・DO を起こす前に検証するので、偽の callback は 403 で弾かれ DO 課金にならない。
-`callback_url` に `{"answer": "..."}` を POST。`run_id` を含める場合は URL と一致しなければ 400 `run_id_mismatch`。
-答えは `answer → message → content → text → output → result` の順で抽出し、どれもなければ body 全体の JSON を `answer_text` にする。
-403 `invalid_token`、400 `invalid_json` / `body_must_be_object` / `run_id_mismatch`、404 不明な run、405 POST 以外、409 `already_answered` / `already_cancelled`、410 期限切れ、413 256KB 超、503 `callback_secret_not_configured` / `misconfigured`。
+`callback_url` is `/callbacks/{run_id}/{token}`, where token is `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`. The Worker verifies it before reading the body or waking a DO, so forged callbacks are rejected with 403 and incur no DO charges.
+POST `{"answer": "..."}` to `callback_url`. If `run_id` is included it must match the URL, otherwise 400 `run_id_mismatch`.
+The answer is extracted in the order `answer → message → content → text → output → result`; if none is present, the whole body as JSON becomes `answer_text`.
+Responses: 403 `invalid_token`, 400 `invalid_json` / `body_must_be_object` / `run_id_mismatch`, 404 unknown run, 405 non-POST, 409 `already_answered` / `already_cancelled`, 410 expired, 413 over 256KB, 503 `callback_secret_not_configured` / `misconfigured`.
 
-## セットアップ
+## Setup
 
-**ボタンで:** 上の Deploy to Cloudflare を押すと、リポジトリが自分の GitHub / GitLab に複製され、Durable Object 込みでデプロイされる。設定画面で 4 つの secret（下記）を入力する。
+**With the button:** Click Deploy to Cloudflare above. The repository is cloned into your GitHub / GitLab and deployed with its Durable Objects. Enter the four secrets (below) on the setup page.
 
-**CLI で:**
+**With the CLI:**
 
 ```sh
 bun install
@@ -69,7 +71,7 @@ wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32
 bun run deploy
 ```
 
-Grok Bot の routine（トリガー: Webhook）を作り、POST 先と Key を `CURSOR_WEBHOOK_URL` / `CURSOR_WEBHOOK_API_KEY` に入れる。Instructions の例:
+Create a Grok Bot routine (trigger: Webhook) and put its POST URL and Key into `CURSOR_WEBHOOK_URL` / `CURSOR_WEBHOOK_API_KEY`. Example Instructions (kept in Japanese, as used with the routine; translate as you like):
 
 ```text
 Webhook で起動したら、ペイロードを読む。test: true / 空ボディ / 依頼文が無いものは無視する。
@@ -82,12 +84,14 @@ message を依頼文として扱い、回答を作る。ペイロードの run_i
 4. このチャットには「回答: <要約>」「run_id: …」「callback: HTTP <ステータス>」だけを投稿する。
 ```
 
-- User-Agent を明示する。Python-urllib 既定の UA は Cloudflare に 1010（403）で弾かれ、Worker まで届かない。
-- 最初に届いた callback で回答が確定する（2 回目以降は 409）。probe を送ると probe の内容が回答になる。
+In short, the routine must: echo the incoming `run_id`, POST the full answer to `callback_url` with no `Authorization` header, retry once only on network errors or 5xx, and never send probe/test POSTs.
 
-## MCP クライアントの接続
+- Set the User-Agent explicitly. Python-urllib's default UA is blocked by Cloudflare with 1010 (403) before reaching the Worker.
+- The first callback to arrive finalizes the answer (later ones get 409). A probe POST would become the answer.
 
-transport は Streamable HTTP（stdio ではない）。URL は `https://<worker>.workers.dev/mcp`、認証は `Authorization: Bearer <MCP_API_KEY>`（または `X-API-Key`）。
+## Connecting MCP clients
+
+The transport is Streamable HTTP (not stdio). URL: `https://<worker>.workers.dev/mcp`, auth: `Authorization: Bearer <MCP_API_KEY>` (or `X-API-Key`).
 
 Claude Code:
 
@@ -96,7 +100,7 @@ claude mcp add --transport http grokbot https://<worker>.workers.dev/mcp \
   --header "Authorization: Bearer $MCP_API_KEY"
 ```
 
-JSON 設定（Claude Code の `.mcp.json` は `${VAR}` を環境変数で展開する。展開しないクライアントでは値を直接書く）:
+JSON config (Claude Code's `.mcp.json` expands `${VAR}` from the environment; for clients that don't, write the value directly):
 
 ```json
 {
@@ -110,9 +114,9 @@ JSON 設定（Claude Code の `.mcp.json` は `${VAR}` を環境変数で展開�
 }
 ```
 
-Cursor の `mcp.json` も同じ形（`type` は省略可）。キーをリポジトリに commit しないこと。
+Cursor's `mcp.json` has the same shape (`type` may be omitted). Never commit the key to the repository.
 
-接続確認（4 つのツール名が返れば OK）:
+Check the connection (you should see the four tool names):
 
 ```sh
 curl -s https://<worker>.workers.dev/mcp \
@@ -121,33 +125,33 @@ curl -s https://<worker>.workers.dev/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -o '"name":"[a-z_]*"'
 ```
 
-## ローカル開発
+## Local development
 
-ローカル開発は `.dev.vars.example` を `.dev.vars` にコピーして値を埋め、`bun run dev`。テストは `bun run test`、型チェックは `bun run typecheck`。
+Copy `.dev.vars.example` to `.dev.vars`, fill in the values, and run `bun run dev`. Tests: `bun run test`. Type check: `bun run typecheck`.
 
-## コストガードレール
+## Cost guardrails
 
-| ガードレール | 上限の対象 | 設定 |
+| Guardrail | What it caps | Where |
 | --- | --- | --- |
-| `ASK_PER_MINUTE_LIMIT`（既定 10） | `ask_grokbot` の全体の分間件数。超えると `rate_limited` + `retry_after_seconds` | `wrangler.jsonc` vars |
-| `ASK_DAILY_LIMIT`（既定 200、UTC 日） | `ask_grokbot` の日次件数。超えると `daily_limit_reached` | 同上 |
-| `COST_KILL_SWITCH="1"` | `ask_grokbot` を即停止（`disabled`） | 同上（変更後に deploy） |
-| `MCP_RATE_LIMITER`（60 回/分） | `/mcp` 全体の呼び出し数（wait / get を含む）。超えると 429。ロケーション単位の近似 | `wrangler.jsonc` ratelimits |
-| HMAC callback token | 偽 callback による body 読み込みと DO 起動 | `CALLBACK_SIGNING_SECRET` |
-| `message` 20,000 文字 / webhook タイムアウト 10 秒 | 1 件あたりの入力サイズ、webhook の待ち時間 | `src/index.ts` 定数 |
-| `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | 1 回の待機時間、回答待ちの期限、終了後の保存期間（0 = 削除しない） | vars |
+| `ASK_PER_MINUTE_LIMIT` (default 10) | Global per-minute `ask_grokbot` count. Beyond it: `rate_limited` + `retry_after_seconds` | `wrangler.jsonc` vars |
+| `ASK_DAILY_LIMIT` (default 200, UTC day) | Daily `ask_grokbot` count. Beyond it: `daily_limit_reached` | same |
+| `COST_KILL_SWITCH="1"` | Stops `ask_grokbot` immediately (`disabled`) | same (deploy after changing) |
+| `MCP_RATE_LIMITER` (60/min) | All `/mcp` calls (including wait / get). Beyond it: 429. Approximate, per location | `wrangler.jsonc` ratelimits |
+| HMAC callback token | Body reads and DO wake-ups from forged callbacks | `CALLBACK_SIGNING_SECRET` |
+| `message` 20,000 chars / webhook timeout 10 s | Per-request input size and webhook wait | constants in `src/index.ts` |
+| `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | Single wait, deadline for the answer, retention after finish (0 = keep forever) | vars |
 
-上限は単一 DO `Budget("global")` で正確にカウントする。拒否された ask は webhook も Run DO も作らない。
-webhook が 4xx を返した ask は受理されていないので枠を戻す。5xx・タイムアウト（10 秒）・通信断は相手側で処理された可能性があるので戻さない。
-vars が数値として不正なら `/mcp` と callback は 503 `misconfigured` を返す（上限が効かない状態で動かさない）。
+Limits are counted exactly in a single DO, `Budget("global")`. A rejected ask creates neither a webhook call nor a Run DO.
+An ask whose webhook returned 4xx was not accepted, so its slot is refunded. 5xx, timeouts (10 s) and connection drops may have been processed on the other side, so they are not refunded.
+If a var is not a valid number, `/mcp` and callbacks return 503 `misconfigured` (the service never runs with limits disabled).
 
-残る最悪ケース（推定）: 日次上限を毎日最大待機で使い切っても、DO は約 800 リクエスト・約 4,500 GB-s / 日で、Free の日次枠・Paid の月間無料枠に収まる。Grok Bot / Cursor 側の利用量は `ASK_DAILY_LIMIT` 件/日が上限になる。
-`/mcp` への未認証リクエストと不正 token の callback は Worker リクエスト課金（$0.30/M）のみ。
+Remaining worst case (estimate): even if the daily limit is used up every day at maximum wait, the DOs stay around 800 requests and 4,500 GB-s per day, within the Free daily allowance and the Paid monthly free allowance. Grok Bot / Cursor usage is capped at `ASK_DAILY_LIMIT` per day.
+Unauthenticated `/mcp` requests and callbacks with a bad token cost only Worker request charges ($0.30/M).
 
-手動で設定しておくもの:
-- Cloudflare ダッシュボード → Billing → Billable Usage → 予算アラート（通知のみで停止はしない）
-- Cursor 側の利用上限（spend limit）
+Set these up manually:
+- Cloudflare dashboard → Billing → Billable Usage → budget alert (notifies only; it does not stop usage)
+- A spend limit on the Cursor side
 
 ## License
 
-[MIT](LICENSE)。脆弱性の報告は [SECURITY.md](SECURITY.md) を参照。
+[MIT](LICENSE). See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.

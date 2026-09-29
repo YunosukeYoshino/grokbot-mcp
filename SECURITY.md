@@ -1,5 +1,6 @@
 # Security Policy
 
-脆弱性は公開 Issue に書かず、GitHub の [Private vulnerability reporting](../../security/advisories/new) で報告してください。
+Please do not report vulnerabilities in public issues. Use GitHub's [Private vulnerability reporting](../../security/advisories/new).
+脆弱性は公開 Issue に書かず、GitHub の Private vulnerability reporting で報告してください。
 
-対象: 認証（`MCP_API_KEY`）、callback の HMAC token 検証、コストガードレールの回避、secret の漏えい。
+In scope / 対象: authentication (`MCP_API_KEY`), callback HMAC token verification, bypass of the cost guardrails, secret leakage.
