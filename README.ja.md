@@ -38,7 +38,9 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 | `src/config.ts` | vars の検証（不正なら fail-closed） |
 | `test/bridge.test.ts` | Workers ランタイム上の統合テスト（vitest-pool-workers） |
 
-## MCP ツール（`POST /mcp`、`Authorization: Bearer $MCP_API_KEY` または `X-API-Key: $MCP_API_KEY`）
+## MCP ツール
+
+エンドポイント: `POST /mcp`。認証: `Authorization: Bearer $MCP_API_KEY` または `X-API-Key: $MCP_API_KEY`。
 
 | Tool | 用途 |
 |---|---|
@@ -51,10 +53,20 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 
 ## Callback（Grok Bot → Worker）
 
-`callback_url` は `/callbacks/{run_id}/{token}`、token は `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`。Worker が body を読む前・DO を起こす前に検証するので、偽の callback は 403 で弾かれ DO 課金にならない。
-`callback_url` に `{"answer": "..."}` を POST。`run_id` を含める場合は URL と一致しなければ 400 `run_id_mismatch`。
-答えは `answer → message → content → text → output → result` の順で抽出し、どれもなければ body 全体の JSON を `answer_text` にする。
-403 `invalid_token`、400 `invalid_json` / `body_must_be_object` / `run_id_mismatch`、404 不明な run、405 POST 以外、409 `already_answered` / `already_cancelled`、410 期限切れ、413 256KB 超、503 `callback_secret_not_configured` / `misconfigured`。
+- `callback_url` は `/callbacks/{run_id}/{token}`、token は `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`。Worker が body を読む前・DO を起こす前に検証するので、偽の callback は 403 で弾かれ DO 課金にならない。
+- `callback_url` に `{"answer": "..."}` を POST。`run_id` を含める場合は URL と一致しなければ 400 `run_id_mismatch`。
+- 答えは `answer → message → content → text → output → result` の順で抽出し、どれもなければ body 全体の JSON を `answer_text` にする。
+
+| ステータス | 意味 |
+|---|---|
+| 400 | `invalid_json` / `body_must_be_object` / `run_id_mismatch` |
+| 403 | `invalid_token` |
+| 404 | 不明な run |
+| 405 | POST 以外 |
+| 409 | `already_answered` / `already_cancelled` |
+| 410 | 期限切れ |
+| 413 | body が 256KB 超 |
+| 503 | `callback_secret_not_configured` / `misconfigured` |
 
 ## セットアップ
 
@@ -139,12 +151,12 @@ curl -s https://<worker>.workers.dev/mcp \
 | `message` 20,000 文字 / webhook タイムアウト 10 秒 | 1 件あたりの入力サイズ、webhook の待ち時間 | `src/index.ts` 定数 |
 | `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | 1 回の待機時間、回答待ちの期限、終了後の保存期間（0 = 削除しない） | vars |
 
-上限は単一 DO `Budget("global")` で正確にカウントする。拒否された ask は webhook も Run DO も作らない。
-webhook が 4xx を返した ask は受理されていないので枠を戻す。5xx・タイムアウト（10 秒）・通信断は相手側で処理された可能性があるので戻さない。
-vars が数値として不正なら `/mcp` と callback は 503 `misconfigured` を返す（上限が効かない状態で動かさない）。
+- 上限は単一 DO `Budget("global")` で正確にカウントする。拒否された ask は webhook も Run DO も作らない。
+- webhook が 4xx を返した ask は受理されていないので枠を戻す。5xx・タイムアウト（10 秒）・通信断は相手側で処理された可能性があるので戻さない。
+- vars が数値として不正なら `/mcp` と callback は 503 `misconfigured` を返す（上限が効かない状態で動かさない）。
 
-残る最悪ケース（推定）: 日次上限を毎日最大待機で使い切っても、DO は約 800 リクエスト・約 4,500 GB-s / 日で、Free の日次枠・Paid の月間無料枠に収まる。Grok Bot / Cursor 側の利用量は `ASK_DAILY_LIMIT` 件/日が上限になる。
-`/mcp` への未認証リクエストと不正 token の callback は Worker リクエスト課金（$0.30/M）のみ。
+- 残る最悪ケース（推定）: 日次上限を毎日最大待機で使い切っても、DO は約 800 リクエスト・約 4,500 GB-s / 日で、Free の日次枠・Paid の月間無料枠に収まる。Grok Bot / Cursor 側の利用量は `ASK_DAILY_LIMIT` 件/日が上限になる。
+- `/mcp` への未認証リクエストと不正 token の callback は Worker リクエスト課金（$0.30/M）のみ。
 
 手動で設定しておくもの:
 - Cloudflare ダッシュボード → Billing → Billable Usage → 予算アラート（通知のみで停止はしない）

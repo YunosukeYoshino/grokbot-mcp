@@ -38,7 +38,9 @@ One run = one `Run` Durable Object. Waiters live in DO memory; state lives in DO
 | `src/config.ts` | Validation of vars (fail-closed when invalid) |
 | `test/bridge.test.ts` | Integration tests on the Workers runtime (vitest-pool-workers) |
 
-## MCP tools (`POST /mcp`, `Authorization: Bearer $MCP_API_KEY` or `X-API-Key: $MCP_API_KEY`)
+## MCP tools
+
+Endpoint: `POST /mcp`. Auth: `Authorization: Bearer $MCP_API_KEY` or `X-API-Key: $MCP_API_KEY`.
 
 | Tool | Purpose |
 |---|---|
@@ -51,10 +53,20 @@ One run = one `Run` Durable Object. Waiters live in DO memory; state lives in DO
 
 ## Callback (Grok Bot → Worker)
 
-`callback_url` is `/callbacks/{run_id}/{token}`, where token is `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`. The Worker verifies it before reading the body or waking a DO, so forged callbacks are rejected with 403 and incur no DO charges.
-POST `{"answer": "..."}` to `callback_url`. If `run_id` is included it must match the URL, otherwise 400 `run_id_mismatch`.
-The answer is extracted in the order `answer → message → content → text → output → result`; if none is present, the whole body as JSON becomes `answer_text`.
-Responses: 403 `invalid_token`, 400 `invalid_json` / `body_must_be_object` / `run_id_mismatch`, 404 unknown run, 405 non-POST, 409 `already_answered` / `already_cancelled`, 410 expired, 413 over 256KB, 503 `callback_secret_not_configured` / `misconfigured`.
+- `callback_url` is `/callbacks/{run_id}/{token}`, where token is `HMAC-SHA256(CALLBACK_SIGNING_SECRET, run_id)`. The Worker verifies it before reading the body or waking a DO, so forged callbacks are rejected with 403 and incur no DO charges.
+- POST `{"answer": "..."}` to `callback_url`. If `run_id` is included it must match the URL, otherwise 400 `run_id_mismatch`.
+- The answer is extracted in the order `answer → message → content → text → output → result`; if none is present, the whole body as JSON becomes `answer_text`.
+
+| Status | Meaning |
+|---|---|
+| 400 | `invalid_json` / `body_must_be_object` / `run_id_mismatch` |
+| 403 | `invalid_token` |
+| 404 | unknown run |
+| 405 | non-POST |
+| 409 | `already_answered` / `already_cancelled` |
+| 410 | expired |
+| 413 | body over 256KB |
+| 503 | `callback_secret_not_configured` / `misconfigured` |
 
 ## Setup
 
@@ -141,12 +153,12 @@ Copy `.dev.vars.example` to `.dev.vars`, fill in the values, and run `bun run de
 | `message` 20,000 chars / webhook timeout 10 s | Per-request input size and webhook wait | constants in `src/index.ts` |
 | `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | Single wait, deadline for the answer, retention after finish (0 = keep forever) | vars |
 
-Limits are counted exactly in a single DO, `Budget("global")`. A rejected ask creates neither a webhook call nor a Run DO.
-An ask whose webhook returned 4xx was not accepted, so its slot is refunded. 5xx, timeouts (10 s) and connection drops may have been processed on the other side, so they are not refunded.
-If a var is not a valid number, `/mcp` and callbacks return 503 `misconfigured` (the service never runs with limits disabled).
+- Limits are counted exactly in a single DO, `Budget("global")`. A rejected ask creates neither a webhook call nor a Run DO.
+- An ask whose webhook returned 4xx was not accepted, so its slot is refunded. 5xx, timeouts (10 s) and connection drops may have been processed on the other side, so they are not refunded.
+- If a var is not a valid number, `/mcp` and callbacks return 503 `misconfigured` (the service never runs with limits disabled).
 
-Remaining worst case (estimate): even if the daily limit is used up every day at maximum wait, the DOs stay around 800 requests and 4,500 GB-s per day, within the Free daily allowance and the Paid monthly free allowance. Grok Bot / Cursor usage is capped at `ASK_DAILY_LIMIT` per day.
-Unauthenticated `/mcp` requests and callbacks with a bad token cost only Worker request charges ($0.30/M).
+- Remaining worst case (estimate): even if the daily limit is used up every day at maximum wait, the DOs stay around 800 requests and 4,500 GB-s per day, within the Free daily allowance and the Paid monthly free allowance. Grok Bot / Cursor usage is capped at `ASK_DAILY_LIMIT` per day.
+- Unauthenticated `/mcp` requests and callbacks with a bad token cost only Worker request charges ($0.30/M).
 
 Set these up manually:
 - Cloudflare dashboard → Billing → Billable Usage → budget alert (notifies only; it does not stop usage)
