@@ -3,18 +3,24 @@
   "name": "grokbot-bridge",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-22",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   "durable_objects": {
     "bindings": [
       { "name": "RUN", "class_name": "Run" },
-      { "name": "BUDGET", "class_name": "Budget" }
+      { "name": "BUDGET", "class_name": "Budget" },
+      { "name": "OAUTH_STATE_GUARD", "class_name": "OAuthStateGuard" },
+      { "name": "OAUTH_ADMISSION_GUARD", "class_name": "OAuthAdmissionGuard" },
+      { "name": "OAUTH_TOKEN_GUARD", "class_name": "OAuthTokenGuard" }
     ]
   },
   // /mcp 全体の上限（ロケーション単位・結果整合。ask の正確な上限は Budget DO が担う）
   "ratelimits": [{ "name": "MCP_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Run"] },
-    { "tag": "v2", "new_sqlite_classes": ["Budget"] }
+    { "tag": "v2", "new_sqlite_classes": ["Budget"] },
+    { "tag": "v3", "new_sqlite_classes": ["OAuthStateGuard"] },
+    { "tag": "v4", "new_sqlite_classes": ["OAuthAdmissionGuard", "OAuthTokenGuard"] }
   ],
   "vars": {
     "MAX_WAIT_SECONDS": "180",
@@ -24,6 +30,8 @@
     "ASK_DAILY_LIMIT": "200",
     "COST_KILL_SWITCH": "0"
   },
+  // GitHub OAuth（任意）の GITHUB_OWNER_ID / GITHUB_CLIENT_ID はデプロイ先ごとの値なので secret か dashboard の vars で設定する（keep_vars で deploy 時に消さない）
+  "keep_vars": true,
   "observability": { "enabled": true }
-  // secrets: CURSOR_WEBHOOK_URL, CURSOR_WEBHOOK_API_KEY, MCP_API_KEY, CALLBACK_SIGNING_SECRET
+  // OAUTH_KV は初回 deploy で自動作成され、以降は既存の binding を引き継ぐ。Secrets: CURSOR_WEBHOOK_URL, CURSOR_WEBHOOK_API_KEY, MCP_API_KEY, CALLBACK_SIGNING_SECRET（OAuth を使うなら GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_OWNER_ID）
 }

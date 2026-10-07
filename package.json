@@ -37,10 +37,19 @@
         "description": "同じ routine の **キー**（`crsr_...`）。Bearer として webhook に付ける。"
       },
       "MCP_API_KEY": {
-        "description": "MCP クライアントが `/mcp` に付ける API キー。`openssl rand -hex 32` で生成する。"
+        "description": "MCP クライアントが `/mcp` に付ける API キー。`openssl rand -hex 32` で生成する。GitHub OAuth だけで使うなら後で削除してよい。"
       },
       "CALLBACK_SIGNING_SECRET": {
         "description": "callback URL の HMAC 署名用 secret。`openssl rand -hex 32` で生成する（`MCP_API_KEY` とは別の値）。"
+      },
+      "GITHUB_CLIENT_ID": {
+        "description": "（任意・OAuth 用）GitHub OAuth App の Client ID。"
+      },
+      "GITHUB_CLIENT_SECRET": {
+        "description": "（任意・OAuth 用）GitHub OAuth App の Client Secret。"
+      },
+      "GITHUB_OWNER_ID": {
+        "description": "（任意・OAuth 用）この bridge を使える GitHub アカウントの数値 ID（`gh api user --jq .id` で確認）。"
       }
     }
   },

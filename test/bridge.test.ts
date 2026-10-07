@@ -7,7 +7,9 @@ const BASE = "https://bridge.test";
 const ctx = { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext;
 
 function call(path: string, init: RequestInit = {}) {
-  return worker.fetch(new Request(BASE + path, init) as Request<unknown, IncomingRequestCfProperties>, env, ctx);
+  const headers = new Headers(init.headers);
+  if (!headers.has("cf-connecting-ip")) headers.set("cf-connecting-ip", "192.0.2.1");
+  return worker.fetch(new Request(BASE + path, { ...init, headers }) as Request<unknown, IncomingRequestCfProperties>, env, ctx);
 }
 
 let rpcId = 0;
@@ -56,6 +58,178 @@ function postCallback(url: string, body: unknown) {
   });
 }
 
+function collectCookies(headers: Headers, jar: Map<string, string>) {
+  const extended = headers as Headers & { getSetCookie?: () => string[] };
+  const setCookies = extended.getSetCookie?.() ?? (headers.get("set-cookie") ? [headers.get("set-cookie")!] : []);
+  for (const cookie of setCookies) {
+    const pair = cookie.split(";", 1)[0];
+    const equals = pair.indexOf("=");
+    if (equals < 1) continue;
+    const name = pair.slice(0, equals);
+    const value = pair.slice(equals + 1);
+    if (/max-age=0/i.test(cookie) || !value) jar.delete(name);
+    else jar.set(name, value);
+  }
+}
+
+function cookieHeader(jar: Map<string, string>) {
+  return Array.from(jar, ([name, value]) => `${name}=${value}`).join("; ");
+}
+
+function base64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function pkceChallenge(verifier: string) {
+  return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+}
+
+async function registerOAuthClient(redirectUris = ["https://client.test/callback"]) {
+  const response = await call("/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_name: "Bridge test client",
+      redirect_uris: redirectUris,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    }),
+  });
+  expect(response.status).toBe(201);
+  return (await response.json()) as { client_id: string };
+}
+
+async function beginGitHubOAuth(options: {
+  registeredRedirectUri?: string;
+  redirectUri?: string;
+  scope?: string;
+  resource?: string;
+  decision?: "approve" | "deny";
+} = {}) {
+  const resource = options.resource ?? `${BASE}/mcp`;
+  const registeredRedirectUri = options.registeredRedirectUri ?? "https://client.test/callback";
+  const redirectUri = options.redirectUri ?? registeredRedirectUri;
+  const client = await registerOAuthClient([registeredRedirectUri]);
+  const cookies = new Map<string, string>();
+  const verifier = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = await pkceChallenge(verifier);
+  const requestedScope = options.scope ?? "grokbot:use";
+  const authParams = new URLSearchParams({
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    state: "mcp-state-test",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    resource,
+  });
+  if (requestedScope) authParams.set("scope", requestedScope);
+  const consent = await call(`/authorize?${authParams}`, { method: "GET" });
+  if (consent.status !== 200) return { client, consent, cookies, verifier, challenge, resource, redirectUri };
+  const consentHtml = await consent.text();
+  const handle = consentHtml.match(/name="handle" value="([^"]+)"/)?.[1];
+  expect(handle).toBeTruthy();
+  collectCookies(consent.headers, cookies);
+
+  const form = new URLSearchParams({ handle: handle!, decision: options.decision ?? "approve" });
+  if (requestedScope) form.set("scope", requestedScope);
+  const githubRedirect = await call("/authorize", {
+    method: "POST",
+    headers: { cookie: cookieHeader(cookies), "content-type": "application/x-www-form-urlencoded" },
+    body: form,
+  });
+  if (options.decision === "deny" || githubRedirect.status !== 302) {
+    return { client, consent, cookies, verifier, challenge, resource, redirectUri, githubRedirect };
+  }
+  expect(githubRedirect.status).toBe(302);
+  collectCookies(githubRedirect.headers, cookies);
+  const githubUrl = new URL(githubRedirect.headers.get("location")!);
+  expect(githubUrl.origin).toBe("https://github.com");
+  expect(githubUrl.searchParams.get("code_challenge_method")).toBe("S256");
+  expect(githubUrl.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+  return { client, consent, cookies, verifier, challenge, resource, redirectUri, githubUrl, githubRedirect };
+}
+
+async function completeGitHubOAuth(githubId: number, options: Parameters<typeof beginGitHubOAuth>[0] & {
+  tokenVerifier?: string;
+  tokenResource?: string;
+  parallelCallbackReplay?: boolean;
+  sequentialCallbackReplay?: boolean;
+  deferTokenExchange?: boolean;
+} = {}) {
+  const started = await beginGitHubOAuth(options);
+  const { client, cookies, verifier, resource, redirectUri, githubUrl } = started;
+  if (!githubUrl) throw new Error(`OAuth did not start: ${started.consent.status}`);
+
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    calls.push(url.href);
+    if (url.hostname === "github.com" && url.pathname === "/login/oauth/access_token") {
+      const body = new URLSearchParams(init?.body as string);
+      expect(body.get("code_verifier")).toBeTruthy();
+      return Response.json({ access_token: "github-token-test", token_type: "bearer", scope: "read:user" });
+    }
+    if (url.hostname === "api.github.com" && url.pathname === "/user") return Response.json({ id: githubId });
+    return originalFetch(input as RequestInfo, init);
+  });
+
+  const callbackPath = `/oauth/github/callback?code=github-code-test&state=${encodeURIComponent(githubUrl.searchParams.get("state")!)}`;
+  const callbackWithoutCookie = await call(callbackPath, { method: "GET" });
+  expect(callbackWithoutCookie.status).toBe(400);
+  const callbackInit = { method: "GET", headers: { cookie: cookieHeader(cookies) } };
+  const callbackResponses = options.parallelCallbackReplay
+    ? await Promise.all([call(callbackPath, callbackInit), call(callbackPath, callbackInit)])
+    : [await call(callbackPath, callbackInit)];
+  const githubCallback = callbackResponses.find((response) => response.status === 302) ?? callbackResponses[0];
+  if (options.sequentialCallbackReplay) callbackResponses.push(await call(callbackPath, callbackInit));
+  expect(githubCallback.status).toBe(githubId === Number(env.GITHUB_OWNER_ID) ? 302 : 403);
+  vi.restoreAllMocks();
+  if (options.parallelCallbackReplay) {
+    expect(callbackResponses.filter((response) => response.status === 302)).toHaveLength(1);
+    expect(callbackResponses.filter((response) => response.status !== 302)).toHaveLength(1);
+  }
+  if (options.sequentialCallbackReplay) expect(callbackResponses[1].status).toBe(400);
+  if (githubId !== Number(env.GITHUB_OWNER_ID)) return { githubCallback, calls };
+
+  const mcpRedirect = new URL(githubCallback.headers.get("location")!);
+  expect(mcpRedirect.origin).toBe("https://client.test");
+  expect(mcpRedirect.searchParams.get("state")).toBe("mcp-state-test");
+  const tokenExchange = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: client.client_id,
+    code: mcpRedirect.searchParams.get("code")!,
+    redirect_uri: redirectUri,
+    code_verifier: options.tokenVerifier ?? verifier,
+    resource: options.tokenResource ?? resource,
+  });
+  if (options.deferTokenExchange) return { githubCallback, calls, tokenExchange, client, verifier, resource, redirectUri };
+  const tokenResponse = await call("/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: tokenExchange,
+  });
+  if (!tokenResponse.ok) return { githubCallback, calls, tokenResponse, tokenExchange };
+  expect(tokenResponse.status).toBe(200);
+  const token = (await tokenResponse.json()) as { access_token: string };
+  const mcpResponse = await call("/mcp", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.access_token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-06-18",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/list", params: {} }),
+  });
+  return { githubCallback, calls, mcpResponse, tokenResponse, token, tokenExchange, callbackResponses };
+}
+
 function runStub(runId: string) {
   return env.RUN.get(env.RUN.idFromName(runId));
 }
@@ -79,6 +253,10 @@ const originalEnv = { ...env };
 
 beforeEach(async () => {
   await runInDurableObject(budgetStub(), (_obj, state) => state.storage.deleteAll());
+  await runInDurableObject(env.OAUTH_ADMISSION_GUARD.get(env.OAUTH_ADMISSION_GUARD.idFromName("global")), (_obj, state) => state.storage.deleteAll());
+  for (const id of await listDurableObjectIds(env.OAUTH_TOKEN_GUARD)) {
+    await runInDurableObject(env.OAUTH_TOKEN_GUARD.get(id), (_obj, state) => state.storage.deleteAll());
+  }
   // 本物の limiter はテスト全体の呼び出し数で詰まるので、既定では常に通す
   env.MCP_RATE_LIMITER = { limit: async () => ({ success: true }) };
 });
@@ -100,6 +278,37 @@ describe("MCP auth", () => {
     expect((await mcp("tools/list", {}, { "x-api-key": "test-key" })).status).toBe(200);
   });
 
+  it("includes OAuth discovery in the unauthenticated challenge and metadata", async () => {
+    const response = await mcp("tools/list", {}, {});
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain(
+      `resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`,
+    );
+
+    const metadata = await call("/.well-known/oauth-protected-resource/mcp");
+    expect(metadata.status).toBe(200);
+    expect(await metadata.json()).toMatchObject({
+      resource: `${BASE}/mcp`,
+      authorization_servers: [BASE],
+      scopes_supported: ["grokbot:use"],
+    });
+  });
+
+  it("disables the shared key when MCP_API_KEY is unset", async () => {
+    env.MCP_API_KEY = "";
+    expect((await mcp("tools/list", {}, { authorization: "Bearer test-key" })).status).toBe(401);
+    expect((await mcp("tools/list", {}, { authorization: "Bearer " })).status).toBe(401);
+  });
+
+  it("keeps the shared key working without GitHub settings while OAuth fails closed", async () => {
+    env.GITHUB_OWNER_ID = "";
+    env.GITHUB_CLIENT_ID = "";
+    env.GITHUB_CLIENT_SECRET = "";
+    expect((await mcp("tools/list", {}, { authorization: "Bearer test-key" })).status).toBe(200);
+    expect((await mcp("tools/list", {}, { "x-api-key": "test-key" })).status).toBe(200);
+    expect((await call("/authorize")).status).toBe(503);
+  });
+
   it("429s when the MCP rate limit is exceeded", async () => {
     env.MCP_RATE_LIMITER = { limit: async () => ({ success: false }) };
     const res = await mcp("tools/list", {});
@@ -111,6 +320,563 @@ describe("MCP auth", () => {
     const res = await mcp("tools/list", {});
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("ask_grokbot");
+  });
+});
+
+describe("GitHub OAuth", () => {
+  it("authorizes the configured GitHub ID and lets its MCP token list tools", async () => {
+    const { githubCallback, calls, mcpResponse } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    expect(githubCallback.status).toBe(302);
+    expect(calls).toEqual(["https://github.com/login/oauth/access_token", "https://api.github.com/user"]);
+    expect(mcpResponse?.status).toBe(200);
+    expect(await mcpResponse?.text()).toContain("ask_grokbot");
+  });
+
+  it("rejects another GitHub ID before issuing an MCP authorization code", async () => {
+    const otherGithubId = Number(env.GITHUB_OWNER_ID) + 1;
+    const { githubCallback } = await completeGitHubOAuth(otherGithubId);
+    expect(githubCallback.status).toBe(403);
+    expect(await githubCallback.text()).toContain("not authorized");
+  });
+
+  it("rejects replayed and expired GitHub state", async () => {
+    const replay = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { sequentialCallbackReplay: true });
+    expect(replay.callbackResponses?.map((response) => response.status)).toEqual([302, 400]);
+    expect(replay.calls.filter((url) => url.endsWith("/login/oauth/access_token"))).toHaveLength(1);
+
+    const expired = await beginGitHubOAuth();
+    const expiredState = expired.githubUrl!.searchParams.get("state")!;
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 11 * 60 * 1000);
+    const expiredCallback = await call(
+      `/oauth/github/callback?code=github-code-test&state=${encodeURIComponent(expiredState)}`,
+      { method: "GET", headers: { cookie: cookieHeader(expired.cookies) } },
+    );
+    expect(expiredCallback.status).toBe(400);
+    expect(await expiredCallback.text()).toContain("expired or was already used");
+  });
+
+  it("issues only one downstream authorization code for concurrent callbacks", async () => {
+    const guardState = "oauth-state-race-test-unique";
+    const guard = env.OAUTH_STATE_GUARD.get(env.OAUTH_STATE_GUARD.idFromName(guardState));
+    expect(await guard.begin()).toBe(true);
+    const consumed = await Promise.all([guard.consume(), guard.consume()]);
+    expect(consumed.filter(Boolean)).toHaveLength(1);
+
+    const { githubCallback, calls } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { parallelCallbackReplay: true });
+    expect(githubCallback.status).toBe(302);
+    expect(calls.filter((url) => url.endsWith("/login/oauth/access_token"))).toHaveLength(1);
+  });
+
+  it("returns access_denied when the user declines consent", async () => {
+    const denied = await beginGitHubOAuth({ decision: "deny" });
+    expect(denied.githubRedirect?.status).toBe(302);
+    const location = new URL(denied.githubRedirect!.headers.get("location")!);
+    expect(location.origin).toBe("https://client.test");
+    expect(location.searchParams.get("error")).toBe("access_denied");
+    expect(location.searchParams.get("state")).toBe("mcp-state-test");
+  });
+
+  it("rejects insecure registrations, unregistered redirects, and unsupported scopes", async () => {
+    const insecure = await call("/oauth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Insecure test client",
+        redirect_uris: ["http://attacker.test/callback"],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+    });
+    expect(insecure.status).toBe(400);
+    expect(await insecure.text()).toContain("OAuth client redirects must use HTTPS or localhost");
+
+    const mismatch = await beginGitHubOAuth({ redirectUri: "https://attacker.test/callback" });
+    expect(mismatch.consent.status).not.toBe(200);
+    expect(mismatch.consent.headers.get("location") ?? "").not.toContain("attacker.test");
+
+    const unsupported = await beginGitHubOAuth({ scope: "grokbot:admin" });
+    expect(unsupported.githubRedirect?.status).toBe(400);
+    expect(await unsupported.githubRedirect?.text()).toContain("Approved scopes must be ones this server supports");
+  });
+
+  it("rejects a wrong resource before issuing a token", async () => {
+    const wrong = await beginGitHubOAuth({ resource: "https://other.test/mcp" });
+    expect(wrong.consent.status).not.toBe(200);
+    expect(wrong.consent.headers.get("location") ?? "").not.toContain("github.com");
+  });
+
+  it("rejects insufficient scopes, wrong PKCE verifier, and a wrong token resource", async () => {
+    const insufficient = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { scope: "" });
+    expect(insufficient.mcpResponse?.status).toBe(403);
+    expect(insufficient.mcpResponse?.headers.get("www-authenticate")).toContain("insufficient_scope");
+
+    const wrongVerifier = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { tokenVerifier: "wrong-verifier" });
+    expect(wrongVerifier.tokenResponse?.status).toBe(400);
+
+    const wrongResource = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { tokenResource: "https://other.test/mcp" });
+    expect(wrongResource.tokenResponse?.status).toBe(400);
+  });
+
+  it("rejects unknown and expired OAuth access tokens", async () => {
+    const invalid = await mcp("tools/list", {}, { authorization: "Bearer never-issued-token" });
+    expect(invalid.status).toBe(401);
+
+    const { tokenResponse, token } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    expect(tokenResponse?.status).toBe(200);
+    const accessToken = token!.access_token;
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 61 * 60 * 1000);
+    const expired = await mcp("tools/list", {}, { authorization: `Bearer ${accessToken}` });
+    expect(expired.status).toBe(401);
+  });
+
+  it("does not redeem a downstream authorization code twice", async () => {
+    const { tokenExchange, token } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const replay = await call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(tokenExchange!),
+    });
+    expect(replay.status).toBe(503);
+    const [userId, grantId] = tokenExchange!.get("code")!.split(":");
+    const guard = env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`));
+    expect(await guard.isRevoked()).toBe(false);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 11_000);
+    const replayAfterGrace = await call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(tokenExchange!),
+    });
+    expect(replayAfterGrace.status).toBe(400);
+    expect(await guard.isRevoked()).toBe(true);
+    expect((await mcp("tools/list", {}, { authorization: `Bearer ${token!.access_token}` })).status).toBe(401);
+  });
+
+  it("atomically redeems authorization codes after PKCE validation", async () => {
+    const started = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { deferTokenExchange: true });
+    const form = new URLSearchParams(started.tokenExchange!);
+    const invalidPkce = new URLSearchParams(form);
+    invalidPkce.set("code_verifier", "incorrect-verifier");
+    const rejected = await call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: invalidPkce,
+    });
+    expect(rejected.status).toBe(400);
+
+    const responses = await Promise.all([
+      call("/oauth/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: form }),
+      call("/oauth/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: form }),
+    ]);
+    expect(responses.filter((response) => response.status === 200)).toHaveLength(1);
+    expect(responses.every((response) => response.status !== 200 || response.headers.get("cache-control")?.includes("no-store"))).toBe(true);
+  });
+
+  it("returns identical refresh responses during retry grace and revokes a later replay", async () => {
+    const { token, tokenResponse, tokenExchange } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    expect(tokenResponse?.status).toBe(200);
+    const initial = token as { access_token: string; refresh_token: string };
+    expect(initial.refresh_token).toBeTruthy();
+
+    const refresh = (refreshToken: string) => call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: tokenExchange!.get("client_id")!, refresh_token: refreshToken, resource: `${BASE}/mcp` }),
+    });
+    const first = await refresh(initial.refresh_token);
+    expect(first.status).toBe(200);
+    const firstBody = await first.text();
+    const retry = await refresh(initial.refresh_token);
+    expect(retry.status).toBe(200);
+    expect(await retry.text()).toBe(firstBody);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000);
+    const replay = await refresh(initial.refresh_token);
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toMatchObject({ error: "invalid_grant" });
+    const [userId, grantId] = initial.refresh_token.split(":");
+    expect(await env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`)).isRevoked()).toBe(true);
+  });
+
+  it("revokes the active token family if a replay changes the original request", async () => {
+    const { token, tokenExchange } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = token as { access_token: string; refresh_token: string };
+    const clientId = tokenExchange!.get("client_id")!;
+    const refresh = (resource: string) => call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: initial.refresh_token, resource }),
+    });
+    expect((await refresh(`${BASE}/mcp`)).status).toBe(200);
+    const alteredRetry = await refresh("https://other.test/mcp");
+    expect(alteredRetry.status).toBe(400);
+    expect(await alteredRetry.json()).toMatchObject({ error: "invalid_grant" });
+    const oldAccessToken = await mcp("tools/list", {}, { authorization: `Bearer ${initial.access_token}` });
+    expect(oldAccessToken.status).toBe(401);
+  });
+
+  it("keeps the grant usable after a refresh the provider rejected before rotating", async () => {
+    const { token, tokenExchange } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = token as { access_token: string; refresh_token: string };
+    const refresh = () => call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: tokenExchange!.get("client_id")!, refresh_token: initial.refresh_token, resource: `${BASE}/mcp` }),
+    });
+    const kv = env.OAUTH_KV;
+    let failGrantWrite = true;
+    env.OAUTH_KV = new Proxy(kv, {
+      get(target, prop) {
+        if (prop === "put") {
+          return (key: string, ...rest: unknown[]) => {
+            if (failGrantWrite && key.startsWith("grant:")) {
+              failGrantWrite = false;
+              throw new Error("KV write failed");
+            }
+            return (target.put as (...args: unknown[]) => unknown)(key, ...rest);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const rejected = await refresh().catch(() => null);
+    expect(rejected?.ok ?? false).toBe(false);
+    expect((await refresh()).status).toBe(200);
+  });
+
+  it("keeps the refresh in flight when the provider failed after rotating the grant", async () => {
+    const { token, tokenExchange } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = token as { access_token: string; refresh_token: string };
+    const refresh = () => call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: tokenExchange!.get("client_id")!, refresh_token: initial.refresh_token, resource: `${BASE}/mcp` }),
+    });
+    const kv = env.OAUTH_KV;
+    let failTokenWrite = true;
+    env.OAUTH_KV = new Proxy(kv, {
+      get(target, prop) {
+        if (prop === "put") {
+          // grant は保存された後、access token の保存で失敗させる（ローテーション確定後の障害）
+          return (key: string, ...rest: unknown[]) => {
+            if (failTokenWrite && key.startsWith("token:")) {
+              failTokenWrite = false;
+              throw new Error("KV write failed");
+            }
+            return (target.put as (...args: unknown[]) => unknown)(key, ...rest);
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failed = await refresh().catch(() => null);
+    expect(failed?.ok ?? false).toBe(false);
+    const retry = await refresh();
+    expect(retry.status).toBe(503);
+    expect(retry.headers.get("retry-after")).toBeTruthy();
+  });
+
+  it("rejects an issued OAuth token after the owner GitHub ID changes", async () => {
+    const { token } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const { access_token } = token as { access_token: string };
+    expect((await mcp("tools/list", {}, { authorization: `Bearer ${access_token}` })).status).toBe(200);
+    env.GITHUB_OWNER_ID = "987654321";
+    expect((await mcp("tools/list", {}, { authorization: `Bearer ${access_token}` })).status).toBe(403);
+  });
+});
+
+describe("OAuth admission and body limits", () => {
+  it("rate-limits OAuth endpoints per IP with Retry-After", async () => {
+    const ip = "192.0.2.77";
+    const responses = [];
+    for (let i = 0; i < 21; i++) responses.push(await call("/authorize?response_type=invalid", { headers: { "cf-connecting-ip": ip } }));
+    expect(responses[19].status).not.toBe(429);
+    expect(responses[20].status).toBe(429);
+    expect(Number(responses[20].headers.get("retry-after"))).toBeGreaterThan(0);
+  });
+
+  it("enforces the exact global OAuth admission limit", async () => {
+    const global = env.OAUTH_ADMISSION_GUARD.get(env.OAUTH_ADMISSION_GUARD.idFromName("global"));
+    const hashIp = async (ip: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ip))), (b) => b.toString(16).padStart(2, "0")).join("");
+    for (let i = 0; i < 120; i++) expect((await global.take(await hashIp(`198.51.100.${i}`), 20, 120)).allowed).toBe(true);
+    const deniedIp = await hashIp("198.51.100.200");
+    const before = await runInDurableObject(global, (_obj, state) => state.storage.get<Record<string, { count: number }>>("ipCounters"));
+    const denied = await global.take(deniedIp, 20, 120);
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAfter).toBeGreaterThan(0);
+    const ipCounters = await runInDurableObject(global, (_obj, state) => state.storage.get<Record<string, { count: number }>>("ipCounters"));
+    expect(ipCounters).toEqual(before);
+    expect(ipCounters?.[deniedIp]).toBeUndefined();
+    expect(await runInDurableObject(global, (_obj, state) => state.storage.getAlarm())).not.toBeNull();
+  });
+
+  it("does not spend global capacity when an IP is already denied", async () => {
+    const global = env.OAUTH_ADMISSION_GUARD.get(env.OAUTH_ADMISSION_GUARD.idFromName("global"));
+    const ipHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("198.51.100.211"))), (b) => b.toString(16).padStart(2, "0")).join("");
+    for (let i = 0; i < 20; i++) expect((await global.take(ipHash, 20, 120)).allowed).toBe(true);
+    expect((await global.take(ipHash, 20, 120)).reason).toBe("ip");
+    const state = await runInDurableObject(global, (_obj, storage) => storage.storage.get<{ count: number }>("counter"));
+    expect(state?.count).toBe(20);
+  });
+
+  it("keeps the new window counters when a delayed older alarm runs", async () => {
+    const global = env.OAUTH_ADMISSION_GUARD.get(env.OAUTH_ADMISSION_GUARD.idFromName("global"));
+    const hashIp = async (ip: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(ip))), (b) => b.toString(16).padStart(2, "0")).join("");
+    const oldWindow = Math.floor(Date.now() / 60_000);
+    expect((await global.take(await hashIp("198.51.100.220"), 20, 120)).allowed).toBe(true);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime((oldWindow + 1) * 60_000 + 100);
+    expect((await global.take(await hashIp("198.51.100.221"), 20, 120)).allowed).toBe(true);
+    expect(await runDurableObjectAlarm(global)).toBe(true);
+    const counter = await runInDurableObject(global, (_obj, state) => state.storage.get<{ window: number; count: number }>("counter"));
+    expect(counter).toMatchObject({ window: oldWindow + 1, count: 1 });
+  });
+
+  it("413s streamed OAuth bodies above the cap and cancels the stream", async () => {
+    let produced = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { produced++; controller.enqueue(new Uint8Array(16 * 1024)); },
+      cancel() { cancelled = true; },
+    });
+    const response = await call("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", "cf-connecting-ip": "192.0.2.88" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect(response.status).toBe(413);
+    expect(produced).toBeLessThan(10);
+    expect(cancelled).toBe(true);
+  });
+
+  it("rejects oversized declared consent and DCR bodies before parsing", async () => {
+    for (const path of ["/authorize", "/oauth/register"]) {
+      const response = await call(path, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", "content-length": String(64 * 1024 + 1), "cf-connecting-ip": `192.0.2.${path === "/authorize" ? "89" : "90"}` },
+        body: "x",
+      });
+      expect(response.status).toBe(413);
+    }
+  });
+});
+
+describe("OAuth recovery and revocation regressions", () => {
+  function tokenPost(form: URLSearchParams) {
+    return call("/oauth/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: form });
+  }
+  function refreshForm(token: string, clientId: string) {
+    return new URLSearchParams({ grant_type: "refresh_token", refresh_token: token, client_id: clientId, resource: `${BASE}/mcp` });
+  }
+  function overrideKv(overrides: Record<string, Function>) {
+    const original = env.OAUTH_KV;
+    env.OAUTH_KV = new Proxy(original, { get(target, key) {
+      if (typeof key === "string" && overrides[key]) return overrides[key];
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    return original;
+  }
+
+  it("releases a code reservation only after a definitive pre-commit KV 429", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { deferTokenExchange: true });
+    const original = env.OAUTH_KV;
+    let failed = false;
+    overrideKv({ put: async (key: string, value: string, options: any) => {
+      if (key.startsWith("grant:") && !failed) { failed = true; throw new Error("KV PUT failed: 429 Too Many Requests"); }
+      return original.put(key, value, options);
+    } });
+    const first = await tokenPost(new URLSearchParams(flow.tokenExchange!));
+    expect(first.status).toBe(429);
+    expect(first.headers.get("retry-after")).toBe("30");
+    env.OAUTH_KV = original;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 30_000);
+    expect((await tokenPost(new URLSearchParams(flow.tokenExchange!))).status).toBe(200);
+  });
+
+  it("releases a refresh reservation when client lookup fails before provider handling", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const original = env.OAUTH_KV;
+    overrideKv({ get: async (key: string, options: unknown) => {
+      if (key === `client:${clientId}`) throw new Error("simulated transient client KV read failure");
+      return original.get(key, options as "json");
+    } });
+    await expect(tokenPost(refreshForm(initial.refresh_token, clientId))).rejects.toThrow("simulated transient client KV read failure");
+    env.OAUTH_KV = original;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
+    expect((await tokenPost(refreshForm(initial.refresh_token, clientId))).status).toBe(200);
+    const [userId, grantId] = initial.refresh_token.split(":");
+    expect(await env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`)).isRevoked()).toBe(false);
+  });
+
+  it("preserves the retry-cache cleanup alarm after a later refresh aborts", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const first = await tokenPost(refreshForm(initial.refresh_token, clientId));
+    expect(first.status).toBe(200);
+    const rotated = await first.json() as { refresh_token: string };
+    const [userId, grantId] = initial.refresh_token.split(":");
+    const guard = env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`));
+
+    const original = env.OAUTH_KV;
+    overrideKv({ get: async (key: string, options: unknown) => {
+      if (key === `client:${clientId}`) throw new Error("simulated transient client lookup failure");
+      return original.get(key, options as "json");
+    } });
+    await expect(tokenPost(refreshForm(rotated.refresh_token, clientId))).rejects.toThrow("simulated transient client lookup failure");
+    env.OAUTH_KV = original;
+
+    const alarmAt = await runInDurableObject(guard, (_obj, state) => state.storage.getAlarm());
+    expect(alarmAt).not.toBeNull();
+    expect(alarmAt! - Date.now()).toBeLessThanOrEqual(11_000);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 11_000);
+    expect(await runDurableObjectAlarm(guard)).toBe(true);
+    const usedHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(initial.refresh_token))), (b) => b.toString(16).padStart(2, "0")).join("");
+    const used = await runInDurableObject(guard, (_obj, state) => state.storage.get<{ response?: unknown; replayUntil: number }>(`used:${usedHash}`));
+    expect(used?.response).toBeUndefined();
+    expect(used?.replayUntil).toBeLessThan(Date.now());
+  });
+
+  it("releases a refresh reservation after a definitive pre-commit KV 429", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const original = env.OAUTH_KV;
+    let failed = false;
+    overrideKv({ put: async (key: string, value: string, options: any) => {
+      if (key.startsWith("grant:") && !failed) { failed = true; throw new Error("KV PUT failed: 429 Too Many Requests"); }
+      return original.put(key, value, options);
+    } });
+    const first = await tokenPost(refreshForm(initial.refresh_token, clientId));
+    expect(first.status).toBe(429);
+    expect(first.headers.get("retry-after")).toBe("30");
+    env.OAUTH_KV = original;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 30_000);
+    expect((await tokenPost(refreshForm(initial.refresh_token, clientId))).status).toBe(200);
+  });
+
+  it("keeps an uncertain refresh reservation fail-closed after grant mutation", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const original = env.OAUTH_KV;
+    overrideKv({ put: async (key: string, value: string, options: any) => {
+      if (key.startsWith("token:")) throw new Error("KV PUT failed: 429 Too Many Requests");
+      return original.put(key, value, options);
+    } });
+    const first = await tokenPost(refreshForm(initial.refresh_token, clientId));
+    expect(first.status).toBe(429);
+    env.OAUTH_KV = original;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31_000);
+    const retry = await tokenPost(refreshForm(initial.refresh_token, clientId));
+    expect(retry.status).toBe(400);
+    expect(await retry.json()).toMatchObject({ error: "invalid_grant" });
+    const [userId, grantId] = initial.refresh_token.split(":");
+    expect(await env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`)).isRevoked()).toBe(true);
+  });
+
+  it("removes expired cached token bodies but retains refresh replay hashes", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const first = await tokenPost(refreshForm(initial.refresh_token, flow.tokenExchange!.get("client_id")!));
+    const response = await first.text();
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(initial.refresh_token))), (b) => b.toString(16).padStart(2, "0")).join("");
+    const [userId, grantId] = initial.refresh_token.split(":");
+    const stub = env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`));
+    const encrypted = await runInDurableObject(stub, (_obj, state) => state.storage.get<{ response?: { iv: string; ciphertext: string; body?: string } }>(`used:${hash}`));
+    expect(encrypted?.response?.ciphertext).toMatch(/^[0-9a-f]+$/);
+    expect(encrypted?.response?.body).toBeUndefined();
+    expect(encrypted?.response?.ciphertext).not.toContain(response);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const used = await runInDurableObject(stub, (_obj, state) => state.storage.get<{ response?: { ciphertext: string }; replayUntil: number }>(`used:${hash}`));
+    expect(used?.response).toBeUndefined();
+    expect(used?.replayUntil).toBeLessThan(Date.now());
+    expect(used).toBeTruthy();
+    expect(response).toContain("refresh_token");
+  });
+
+  it("fails closed when an encrypted retry response is tampered with", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    expect((await tokenPost(refreshForm(initial.refresh_token, clientId))).status).toBe(200);
+    const [userId, grantId] = initial.refresh_token.split(":");
+    const guard = env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`));
+    const tokenHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(initial.refresh_token))), (b) => b.toString(16).padStart(2, "0")).join("");
+    await runInDurableObject(guard, async (_obj, state) => {
+      const key = `used:${tokenHash}`;
+      const record = await state.storage.get<any>(key);
+      expect(record.response.iv).toMatch(/^[0-9a-f]{24}$/);
+      record.response.ciphertext = `${record.response.ciphertext[0] === "0" ? "1" : "0"}${record.response.ciphertext.slice(1)}`;
+      await state.storage.put(key, record);
+    });
+    const retry = await tokenPost(refreshForm(initial.refresh_token, clientId));
+    expect(retry.status).toBe(400);
+    expect(await retry.json()).toMatchObject({ error: "invalid_grant" });
+    expect(await guard.isRevoked()).toBe(true);
+  });
+
+  it("synchronizes authenticated refresh grant revocation with the retry cache", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { access_token: string; refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const form = refreshForm(initial.refresh_token, clientId);
+    const refreshed = await tokenPost(form);
+    expect(refreshed.status).toBe(200);
+    const rotated = await refreshed.json() as { access_token: string; refresh_token: string };
+    const revoke = await tokenPost(new URLSearchParams({ client_id: clientId, token: rotated.refresh_token, token_type_hint: "refresh_token" }));
+    expect(revoke.status).toBe(200);
+    const retry = await tokenPost(form);
+    expect(retry.status).toBe(400);
+    expect(await retry.json()).toMatchObject({ error: "invalid_grant" });
+    expect((await mcp("tools/list", {}, { authorization: `Bearer ${rotated.access_token}` })).status).toBe(401);
+  });
+
+  it("allows a lost-response retry at the rotation cap", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID));
+    const initial = flow.token as unknown as { refresh_token: string };
+    const clientId = flow.tokenExchange!.get("client_id")!;
+    const form = refreshForm(initial.refresh_token, clientId);
+    const first = await tokenPost(form);
+    expect(first.status).toBe(200);
+    const originalBody = await first.text();
+    const [userId, grantId] = initial.refresh_token.split(":");
+    const stub = env.OAUTH_TOKEN_GUARD.get(env.OAUTH_TOKEN_GUARD.idFromName(`grant:${userId}:${grantId}`));
+    await runInDurableObject(stub, (_obj, state) => state.storage.put("refreshRotationCount", 1_000));
+    const retry = await tokenPost(form);
+    expect(retry.status).toBe(200);
+    expect(await retry.text()).toBe(originalBody);
+  });
+
+  it("returns 503 rather than issuing a second code token from stale KV state", async () => {
+    const flow = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { deferTokenExchange: true });
+    const [userId, grantId] = flow.tokenExchange!.get("code")!.split(":");
+    const key = `grant:${userId}:${grantId}`;
+    const staleGrant = await env.OAUTH_KV.get(key, "json");
+    const first = await tokenPost(new URLSearchParams(flow.tokenExchange!));
+    expect(first.status).toBe(200);
+    const firstToken = await first.json() as { access_token: string };
+    const original = env.OAUTH_KV;
+    overrideKv({ get: async (requested: string, options: unknown) => requested === key ? staleGrant : original.get(requested, options as "json") });
+    expect((await tokenPost(new URLSearchParams(flow.tokenExchange!))).status).toBe(503);
+    expect((await mcp("tools/list", {}, { authorization: `Bearer ${firstToken.access_token}` })).status).toBe(200);
   });
 });
 
