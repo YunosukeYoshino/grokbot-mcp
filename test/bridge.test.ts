@@ -298,6 +298,10 @@ describe("MCP auth", () => {
     env.MCP_API_KEY = "";
     expect((await mcp("tools/list", {}, { authorization: "Bearer test-key" })).status).toBe(401);
     expect((await mcp("tools/list", {}, { authorization: "Bearer " })).status).toBe(401);
+
+    env.MCP_API_KEY = undefined;
+    expect((await mcp("tools/list", {}, { authorization: "Bearer undefined" })).status).toBe(401);
+    expect((await mcp("tools/list", {}, { "x-api-key": "undefined" })).status).toBe(401);
   });
 
   it("keeps the shared key working without GitHub settings while OAuth fails closed", async () => {
