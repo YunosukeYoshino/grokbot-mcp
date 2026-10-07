@@ -33,14 +33,19 @@ One run = one `Run` Durable Object. Waiters live in DO memory; state lives in DO
 | File | Role |
 |---|---|
 | `src/index.ts` | Worker entry. MCP tools, callback auth and intake, webhook dispatch |
+| `src/oauth.ts` | `/mcp` authentication (API key or GitHub OAuth), GitHub sign-in, and the `/oauth/token` refresh guard |
+| `src/util.ts` | Shared helpers (JSON responses, constant-time compare, SHA-256 hex) |
 | `src/run.ts` | `Run` DO. Run state, waiting, TTL / retention alarms |
 | `src/budget.ts` | `Budget` DO. Per-minute and daily counters for `ask_grokbot` |
+| `src/oauth-state.ts` | `OAuthStateGuard` DO. Atomic one-time consumption of GitHub OAuth callback state |
+| `src/oauth-guard.ts` | `OAuthAdmissionGuard` and `OAuthTokenGuard` DOs. Global/IP admission control, single-use code redemption, refresh retry and grant-revocation state |
+| `patches/@cloudflare%2Fworkers-oauth-provider@1.1.0.patch` | Reproducible provider patch passing Worker Env and refresh-current status to the token callback |
 | `src/config.ts` | Validation of vars (fail-closed when invalid) |
 | `test/bridge.test.ts` | Integration tests on the Workers runtime (vitest-pool-workers) |
 
 ## MCP tools
 
-Endpoint: `POST /mcp`. Auth: `Authorization: Bearer $MCP_API_KEY` or `X-API-Key: $MCP_API_KEY`.
+Endpoint: `POST /mcp`. Authenticate with `Authorization: Bearer $MCP_API_KEY` (or `X-API-Key`), or with GitHub OAuth (see [Authentication](#authentication)).
 
 | Tool | Purpose |
 |---|---|
@@ -70,7 +75,7 @@ Endpoint: `POST /mcp`. Auth: `Authorization: Bearer $MCP_API_KEY` or `X-API-Key:
 
 ## Setup
 
-**With the button:** Click Deploy to Cloudflare above. The repository is cloned into your GitHub / GitLab and deployed with its Durable Objects. Enter the four secrets (below) on the setup page.
+**With the button:** Click Deploy to Cloudflare above. The repository is cloned into your GitHub / GitLab and deployed with its Durable Objects; the `OAUTH_KV` namespace is created automatically. Enter the secrets it asks for (`CURSOR_WEBHOOK_URL`, `CURSOR_WEBHOOK_API_KEY`, `MCP_API_KEY`, `CALLBACK_SIGNING_SECRET`) and you can connect right away with `MCP_API_KEY`. GitHub OAuth is optional and can be added later.
 
 **With the CLI:**
 
@@ -78,10 +83,55 @@ Endpoint: `POST /mcp`. Auth: `Authorization: Bearer $MCP_API_KEY` or `X-API-Key:
 bun install
 wrangler secret put CURSOR_WEBHOOK_URL
 wrangler secret put CURSOR_WEBHOOK_API_KEY
-wrangler secret put MCP_API_KEY        # openssl rand -hex 32
-wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32
+wrangler secret put MCP_API_KEY              # openssl rand -hex 32
+wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32 (a different value)
 bun run deploy
 ```
+
+`OAUTH_KV` has no fixed ID in `wrangler.jsonc`: the first deploy creates it and later deploys reuse the bound namespace.
+
+### Authentication
+
+`/mcp` accepts two kinds of credentials:
+
+| Method | Needs | Use for |
+|---|---|---|
+| API key | `MCP_API_KEY` | Quick start, CLI harnesses (Claude Code, Cursor, curl) |
+| GitHub OAuth | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_OWNER_ID` | ChatGPT / dot and any Remote MCP OAuth client; per-client, expiring, revocable tokens |
+
+Anyone holding `MCP_API_KEY` has full access, and the key cannot be revoked per client. Once every client uses OAuth, delete it (`wrangler secret delete MCP_API_KEY`) to make the bridge OAuth-only.
+
+### GitHub OAuth setup (optional)
+
+Sign-in uses a GitHub OAuth App and only the configured account can receive an MCP token. OAuth stays disabled (`/authorize` returns `503`) until all three values below are set.
+
+1. Register a GitHub OAuth App with the Authorization callback URL `https://<worker-host>/oauth/github/callback`.
+2. Set the app's Client ID, its Client Secret, and the numeric GitHub user ID allowed to use this bridge (`gh api user --jq .id`):
+
+   ```sh
+   wrangler secret put GITHUB_CLIENT_ID
+   wrangler secret put GITHUB_CLIENT_SECRET
+   wrangler secret put GITHUB_OWNER_ID
+   ```
+
+   `GITHUB_CLIENT_ID` and `GITHUB_OWNER_ID` are not secret, so dashboard vars also work; `keep_vars` keeps them across deploys.
+3. Add `https://<worker-host>/mcp` as a Remote MCP server in ChatGPT, dot, or another client and complete the GitHub sign-in/consent flow. The Worker publishes OAuth metadata and supports dynamic client registration.
+
+| Item | Path |
+|---|---|
+| MCP server | `/mcp` |
+| Protected-resource metadata | `/.well-known/oauth-protected-resource/mcp` |
+| Authorization-server metadata | `/.well-known/oauth-authorization-server` |
+| Authorization endpoint | `/authorize` |
+| Token endpoint | `/oauth/token` |
+| Dynamic client registration | `/oauth/register` |
+| Scope | `grokbot:use` |
+
+The client should start with the MCP server URL and discover OAuth metadata automatically. After GitHub consent, verify with `tools/list`; do not call `ask_grokbot` as a connectivity probe.
+
+The `OAUTH_KV` binding stores OAuth client, authorization-code, and token state.
+
+Unauthenticated OAuth routes are limited to 20 requests per IP per minute and 120 total per minute by strongly consistent Durable Object counters. The global and per-IP checks share one transaction; either rejection leaves both counters unchanged. OAuth POST bodies are capped at 64 KiB and oversized streams are cancelled. Downstream authorization codes are atomically consumed only after the provider validates client, redirect URI, resource, and PKCE. A definitive KV `429` before the grant write releases the code reservation for retry. A failed refresh releases its reservation when the grant still points at the presented token; once the grant may have rotated, it stays fail-closed. Refresh retries for the same request receive the identical token response for 10 seconds; the cached response is AES-GCM encrypted with a key derived from `CALLBACK_SIGNING_SECRET`, then the response body is removed while its hash history remains. Authenticated grant revocation also invalidates the retry cache. Reuse after that window revokes the grant and its token family. A grant is also revoked after 1,000 successful rotations to bound replay history; a cached retry is checked before that cap. If another refresh arrives while the first response is being committed, the server returns `503` with `Retry-After` so the client can retry.
 
 Create a Grok Bot routine (trigger: Webhook) and put its POST URL and Key into `CURSOR_WEBHOOK_URL` / `CURSOR_WEBHOOK_API_KEY`. Example Instructions (kept in Japanese, as used with the routine; translate as you like):
 
@@ -103,7 +153,7 @@ In short, the routine must: echo the incoming `run_id`, POST the full answer to 
 
 ## Connecting MCP clients
 
-The transport is Streamable HTTP (not stdio). URL: `https://<worker>.workers.dev/mcp`, auth: `Authorization: Bearer <MCP_API_KEY>` (or `X-API-Key`).
+The transport is Streamable HTTP (not stdio). URL: `https://<worker>.workers.dev/mcp`. The examples below use `MCP_API_KEY`. For OAuth clients (ChatGPT / dot, or Claude Code without `--header`), register only the URL and sign in with GitHub.
 
 Claude Code:
 

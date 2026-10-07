@@ -33,14 +33,19 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 | ファイル | 役割 |
 |---|---|
 | `src/index.ts` | Worker 入口。MCP ツール、callback の認証・受信、webhook 送信 |
+| `src/oauth.ts` | `/mcp` の認証（API キーまたは GitHub OAuth）、GitHub サインイン、`/oauth/token` の refresh ガード |
+| `src/util.ts` | 共通ヘルパー（JSON 応答、定数時間比較、SHA-256 hex） |
 | `src/run.ts` | `Run` DO。run の状態、待機、TTL / retention の alarm |
 | `src/budget.ts` | `Budget` DO。`ask_grokbot` の分間・日次の上限カウント |
+| `src/oauth-state.ts` | `OAuthStateGuard` DO。GitHub OAuth callback state を原子的に一度だけ消費 |
+| `src/oauth-guard.ts` | `OAuthAdmissionGuard` / `OAuthTokenGuard` DO。IP/全体レート制限、code の一回限り消費、refresh 再試行とgrant失効状態 |
+| `patches/@cloudflare%2Fworkers-oauth-provider@1.1.0.patch` | Worker Env と refresh token の現行判定をtoken callbackへ渡す再現可能なprovider patch |
 | `src/config.ts` | vars の検証（不正なら fail-closed） |
 | `test/bridge.test.ts` | Workers ランタイム上の統合テスト（vitest-pool-workers） |
 
 ## MCP ツール
 
-エンドポイント: `POST /mcp`。認証: `Authorization: Bearer $MCP_API_KEY` または `X-API-Key: $MCP_API_KEY`。
+エンドポイント: `POST /mcp`。`Authorization: Bearer $MCP_API_KEY`（または `X-API-Key`）か、GitHub OAuth で認証する（[認証](#認証) 参照）。
 
 | Tool | 用途 |
 |---|---|
@@ -70,7 +75,7 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 
 ## セットアップ
 
-**ボタンで:** 上の Deploy to Cloudflare を押すと、リポジトリが自分の GitHub / GitLab に複製され、Durable Object 込みでデプロイされる。設定画面で 4 つの secret（下記）を入力する。
+**ボタンで:** 上の Deploy to Cloudflare を押すと、リポジトリが自分の GitHub / GitLab に複製され、Durable Object 込みでデプロイされる。`OAUTH_KV` namespace は自動で作られる。聞かれる secret（`CURSOR_WEBHOOK_URL`、`CURSOR_WEBHOOK_API_KEY`、`MCP_API_KEY`、`CALLBACK_SIGNING_SECRET`）を入れれば、すぐ `MCP_API_KEY` で接続できる。GitHub OAuth は任意で、後から追加できる。
 
 **CLI で:**
 
@@ -78,10 +83,55 @@ run 1件 = Durable Object `Run` 1つ。待機中の waiter は DO のメモリ�
 bun install
 wrangler secret put CURSOR_WEBHOOK_URL
 wrangler secret put CURSOR_WEBHOOK_API_KEY
-wrangler secret put MCP_API_KEY        # openssl rand -hex 32
-wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32
+wrangler secret put MCP_API_KEY              # openssl rand -hex 32
+wrangler secret put CALLBACK_SIGNING_SECRET  # openssl rand -hex 32（別の値）
 bun run deploy
 ```
+
+`wrangler.jsonc` の `OAUTH_KV` には固定 ID を書かない。初回 deploy で作成され、以降の deploy は bind 済みの namespace を引き継ぐ。
+
+### 認証
+
+`/mcp` は 2 種類の認証を受け付ける。
+
+| 方式 | 必要な設定 | 用途 |
+|---|---|---|
+| API キー | `MCP_API_KEY` | クイックスタート、CLI ハーネス（Claude Code、Cursor、curl） |
+| GitHub OAuth | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `GITHUB_OWNER_ID` | ChatGPT / dot など Remote MCP OAuth 対応クライアント。クライアントごとに期限付き・失効可能な token |
+
+`MCP_API_KEY` を持つ人は誰でもフルアクセスでき、クライアント単位で失効させられない。全クライアントを OAuth に移したら `wrangler secret delete MCP_API_KEY` で削除すると OAuth 専用になる。
+
+### GitHub OAuth の設定（任意）
+
+サインインには GitHub OAuth App を使い、設定したアカウントだけが MCP token を受け取れる。下記 3 つが揃うまで OAuth は無効（`/authorize` は `503`）。
+
+1. GitHub OAuth App を登録し、Authorization callback URL に `https://<worker-host>/oauth/github/callback` を設定する。
+2. App の Client ID、Client Secret、この bridge を使える GitHub アカウントの数値 ID（`gh api user --jq .id`）を設定する。
+
+   ```sh
+   wrangler secret put GITHUB_CLIENT_ID
+   wrangler secret put GITHUB_CLIENT_SECRET
+   wrangler secret put GITHUB_OWNER_ID
+   ```
+
+   `GITHUB_CLIENT_ID` と `GITHUB_OWNER_ID` は秘密ではないので dashboard の vars でもよい。`keep_vars` により deploy で消えない。
+3. ChatGPT、dot などに `https://<worker-host>/mcp` を Remote MCP server として追加し、GitHub のサインインと同意を完了する。Worker は OAuth metadata を公開し、dynamic client registration に対応している。
+
+| 項目 | パス |
+|---|---|
+| MCP server | `/mcp` |
+| Protected-resource metadata | `/.well-known/oauth-protected-resource/mcp` |
+| Authorization-server metadata | `/.well-known/oauth-authorization-server` |
+| Authorization endpoint | `/authorize` |
+| Token endpoint | `/oauth/token` |
+| Dynamic client registration | `/oauth/register` |
+| Scope | `grokbot:use` |
+
+クライアントにはMCP server URLを登録し、OAuth metadataの自動検出を使う。GitHub consent後は `tools/list` で接続を確認する。疎通確認として `ask_grokbot` は呼び出さない。
+
+`OAUTH_KV` には OAuth client、authorization code、token の状態を保存する。
+
+未認証 OAuth endpoint はDurable Objectの強整合カウンターで、IPごと毎分20件、全体毎分120件までに制限する。IP・全体の判定は同一トランザクションで行い、どちらかが拒否された場合は両カウンターを更新しない。OAuth POST本文は64 KiBまでで、超過streamは読み取りを中止する。authorization code はclient・redirect URI・resource・PKCE検証後に一度だけ予約する。grantのKV書き込み前に確定した429ならcode予約を解除して再試行できる。refreshが失敗したとき、grantがまだ提示tokenを指していれば予約を解除し、ローテーション済みの可能性があればfail-closedにする。同一要求のrefresh再試行には10秒間、同じtoken応答を返す。cache中の応答本文は `CALLBACK_SIGNING_SECRET` 由来の鍵でAES-GCM暗号化し、期限後は本文だけ削除してhash履歴を保持する。認証済みgrant失効も再試行cacheに同期する。期限後の再利用はgrantとtoken群を失効させる。履歴上限のため、refresh成功1,000回後は再認証を求めるが、上限到達時でもcache済み再試行には同じ応答を返す。最初のrefresh応答を処理中の再要求には `Retry-After` 付き `503` を返す。
 
 Grok Bot の routine（トリガー: Webhook）を作り、POST 先と Key を `CURSOR_WEBHOOK_URL` / `CURSOR_WEBHOOK_API_KEY` に入れる。Instructions の例:
 
@@ -101,7 +151,7 @@ message を依頼文として扱い、回答を作る。ペイロードの run_i
 
 ## MCP クライアントの接続
 
-transport は Streamable HTTP（stdio ではない）。URL は `https://<worker>.workers.dev/mcp`、認証は `Authorization: Bearer <MCP_API_KEY>`（または `X-API-Key`）。
+transport は Streamable HTTP（stdio ではない）。URL は `https://<worker>.workers.dev/mcp`。以下は `MCP_API_KEY` を使う例。OAuth クライアント（ChatGPT / dot、`--header` なしの Claude Code など）は URL だけを登録し、GitHub でサインインする。
 
 Claude Code:
 
