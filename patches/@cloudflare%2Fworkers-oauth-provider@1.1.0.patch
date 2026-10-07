@@ -1,0 +1,118 @@
+diff --git a/dist/oauth-provider.d.ts b/dist/oauth-provider.d.ts
+index 00bf11baed9e47799e46c254593f45476d23a5e8..2e0bce797954b3bb8304c65bc78530588d98136b 100644
+--- a/dist/oauth-provider.d.ts
++++ b/dist/oauth-provider.d.ts
+@@ -593,6 +593,8 @@ interface TokenExchangeCallbackOptions {
+    * The type of grant being processed.
+    */
+   grantType: GrantType;
++  /** True only when a refresh request presents the grant's current (never-before-used) refresh token. */
++  isCurrentRefreshToken?: boolean;
+   /**
+    * Client authenticated on this token request. For `authorization_code` and
+    * `refresh_token` it is always the grant's client. For token exchange it is the
+@@ -878,7 +880,17 @@ interface OAuthProviderOptions<Env = Cloudflare.Env> {
+    * The callback can return new props values that will be stored with the token or grant.
+    * If the callback returns nothing or undefined for a props field, the original props will be used.
+    */
+-  tokenExchangeCallback?: (options: TokenExchangeCallbackOptions) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
++  tokenExchangeCallback?: (options: TokenExchangeCallbackOptions & { env: Env }) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
++  /** Called when the exact authorization code for a grant is presented after successful redemption. */
++  authorizationCodeReplayCallback?: (options: { env: Env; userId: string; grantId: string }) => Promise<void> | void;
++  /** Called only when a rate-limited grant KV write definitively failed before code issuance. */
++  authorizationCodePreCommitFailureCallback?: (options: { env: Env; userId: string; grantId: string }) => Promise<void> | void;
++  /** Called only when a rate-limited grant KV write definitively failed before refresh issuance. */
++  refreshTokenPreCommitFailureCallback?: (options: { env: Env; userId: string; grantId: string }) => Promise<void> | void;
++  /** Called after client/resource validation and before the refresh grant handler begins. */
++  tokenRequestCallback?: (options: { env: Env; grantType: GrantType; refreshToken?: string }) => Promise<void> | void;
++  /** Called after an authenticated client successfully revokes its refresh grant. */
++  onGrantRevokedCallback?: (options: { env: Env; userId: string; grantId: string }) => Promise<void> | void;
+   /**
+    * Optional callback called when a provided bearer credential was not found
+    * in the internal KV. It can validate an external OAuth access token, opaque
+diff --git a/dist/oauth-provider.js b/dist/oauth-provider.js
+index a29a82872748e1467cce7c1786f4fb90cef39b4d..73d727833f50c9f1cf48ba1185b81a862bad3b65 100644
+--- a/dist/oauth-provider.js
++++ b/dist/oauth-provider.js
+@@ -2755,7 +2755,10 @@ var OAuthProviderImpl = class {
+ 			}
+ 			this.validateTokenRequestResourceIndicator(body.resource);
+ 			if (grantType === GrantType.AUTHORIZATION_CODE) return await this.handleAuthorizationCodeGrant(body, clientInfo, env);
+-			else if (grantType === GrantType.REFRESH_TOKEN) return await this.handleRefreshTokenGrant(body, clientInfo, env);
++			else if (grantType === GrantType.REFRESH_TOKEN) {
++				if (this.options.tokenRequestCallback) await this.options.tokenRequestCallback({ env, grantType, refreshToken: body.refresh_token });
++				return await this.handleRefreshTokenGrant(body, clientInfo, env);
++			}
+ 			else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) return await this.handleTokenExchangeGrant(body, clientInfo, env);
+ 			else if (grantType === GrantType.JWT_BEARER) return await this.handleJwtBearerGrant(body, clientInfo, env, requestUrl, request);
+ 			throw new Error("Unreachable supported grant type");
+@@ -2867,6 +2870,7 @@ var OAuthProviderImpl = class {
+ 			reason: "client_mismatch"
+ 		});
+ 		if (!grantData.authCodeWrappedKey) {
++			if (this.options.authorizationCodeReplayCallback) await this.options.authorizationCodeReplayCallback({ env, userId, grantId });
+ 			try {
+ 				await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+ 			} catch {}
+@@ -2933,6 +2937,7 @@ var OAuthProviderImpl = class {
+ 			let grantProps = decryptedProps;
+ 			let accessTokenProps = decryptedProps;
+ 			const callbackOptions = {
++				env,
+ 				grantType: GrantType.AUTHORIZATION_CODE,
+ 				clientId: clientInfo.clientId,
+ 				subjectClientId: grantData.clientId,
+@@ -2992,7 +2997,12 @@ var OAuthProviderImpl = class {
+ 			grantData.expiresAt = expiresAt;
+ 		}
+ 		if (resourceResolution.grantResourceBackfill) grantData.resource = resourceResolution.grantResourceBackfill;
+-		await this.saveGrantWithTTL(env, grantKey, grantData, now);
++		try {
++			await this.saveGrantWithTTL(env, grantKey, grantData, now);
++		} catch (error) {
++			if (error instanceof OAuthError && error.options.internal?.reason === "kv_rate_limited") await this.options.authorizationCodePreCommitFailureCallback?.({ env, userId, grantId });
++			throw error;
++		}
+ 		const tokenResponse = {
+ 			access_token: await this.createAccessToken({
+ 				userId,
+@@ -3080,7 +3090,9 @@ var OAuthProviderImpl = class {
+ 			let grantProps = decryptedProps;
+ 			let accessTokenProps = decryptedProps;
+ 			const callbackOptions = {
++				env,
+ 				grantType: GrantType.REFRESH_TOKEN,
++				isCurrentRefreshToken: isCurrentToken,
+ 				clientId: clientInfo.clientId,
+ 				subjectClientId: grantData.clientId,
+ 				userId,
+@@ -3153,7 +3165,12 @@ var OAuthProviderImpl = class {
+ 		grantData.refreshTokenId = newRefreshTokenId;
+ 		grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
+ 		if (resourceResolution.grantResourceBackfill) grantData.resource = resourceResolution.grantResourceBackfill;
+-		await this.saveGrantWithTTL(env, grantKey, grantData, now);
++		try {
++			await this.saveGrantWithTTL(env, grantKey, grantData, now);
++		} catch (error) {
++			if (error instanceof OAuthError && error.options.internal?.reason === "kv_rate_limited") await this.options.refreshTokenPreCommitFailureCallback?.({ env, userId, grantId });
++			throw error;
++		}
+ 		const accessTokenData = {
+ 			id: accessTokenId,
+ 			grantId,
+@@ -3266,6 +3283,7 @@ var OAuthProviderImpl = class {
+ 		if (this.options.tokenExchangeCallback) {
+ 			const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
+ 			const callbackOptions = {
++				env,
+ 				grantType: GrantType.TOKEN_EXCHANGE,
+ 				clientId: clientInfo.clientId,
+ 				subjectClientId: grantData.clientId,
+@@ -3649,6 +3667,7 @@ var OAuthProviderImpl = class {
+ 		if (!grantData) return false;
+ 		if (!(grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId)) return false;
+ 		if (grantData.clientId !== clientInfo.clientId) return false;
++		await this.options.onGrantRevokedCallback?.({ env, userId, grantId });
+ 		await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+ 		return true;
+ 	}

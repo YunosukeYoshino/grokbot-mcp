@@ -5,6 +5,7 @@
     "": {
       "name": "grokbot-bridge",
       "dependencies": {
+        "@cloudflare/workers-oauth-provider": "1.1.0",
         "@modelcontextprotocol/server": "2.0.0",
         "agents": "^0.24.0",
         "zod": "^4.6.5",
@@ -16,6 +17,9 @@
         "wrangler": "^4.135.0",
       },
     },
+  },
+  "patchedDependencies": {
+    "@cloudflare/workers-oauth-provider@1.1.0": "patches/@cloudflare%2Fworkers-oauth-provider@1.1.0.patch",
   },
   "packages": {
     "@babel/code-frame": ["@babel/code-frame@8.0.6", "", { "dependencies": { "@babel/helper-validator-identifier": "^8.0.6", "js-tokens": "^10.0.0" } }, "sha512-uMHhvmDmwFiLuiozaoRYTZHqMFuu3fem/X9JY78lohAuLoh8LSGGC8JqUzo2cVuBsBxkjMZNk56CE7ock8Xxkw=="],
@@ -85,6 +89,8 @@
     "@cloudflare/workerd-linux-arm64": ["@cloudflare/workerd-linux-arm64@1.20260918.1", "", { "os": "linux", "cpu": "arm64" }, "sha512-4rib51MaLNWweUIUxM/Xj558M5QmyZoBSf0ffv+lYah5VTrvwnez3XGxX72pElnBKHROvAPOi5msQ5Ts8JSI0A=="],
 
     "@cloudflare/workerd-windows-64": ["@cloudflare/workerd-windows-64@1.20260918.1", "", { "os": "win32", "cpu": "x64" }, "sha512-sATrMx5ShYYgmgUGrcTmvsFSJBFuN95NEkX3xwb1qk8w1A6h5N11sea7yN2IeibwPyPmXKjWNjXOno0hZAM71Q=="],
+
+    "@cloudflare/workers-oauth-provider": ["@cloudflare/workers-oauth-provider@1.1.0", "", {}, "sha512-J3J7AZ/Iok8DyIeXobc6zk9vSj5oeQB1I6Jxe8OqgvlhTq6nm/9fKhdyjKba82tLzLCfEc0w8yy8s715TeNe6Q=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 

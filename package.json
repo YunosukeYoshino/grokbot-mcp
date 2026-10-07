@@ -17,6 +17,7 @@
     "cf-typegen": "wrangler types --strict-vars=false"
   },
   "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.1.0",
     "@modelcontextprotocol/server": "2.0.0",
     "agents": "^0.24.0",
     "zod": "^4.6.5"
@@ -42,5 +43,8 @@
         "description": "callback URL の HMAC 署名用 secret。`openssl rand -hex 32` で生成する（`MCP_API_KEY` とは別の値）。"
       }
     }
+  },
+  "patchedDependencies": {
+    "@cloudflare/workers-oauth-provider@1.1.0": "patches/@cloudflare%2Fworkers-oauth-provider@1.1.0.patch"
   }
 }
