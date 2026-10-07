@@ -2,6 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 
 const WINDOW_MS = 60_000;
 const REFRESH_RETRY_MS = 10_000;
+// grant は発行から最長 30 日（provider 既定の refreshTokenTTL、refresh しても延びない）なので、初回利用から固定で十分。
+// refreshTokenTTL / refreshTokenIdleTTL を設定するならこれより短く保つこと
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const REFRESH_IN_FLIGHT_MS = 30_000;
 const MAX_REFRESH_ROTATIONS = 1_000;
