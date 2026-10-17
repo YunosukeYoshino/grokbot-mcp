@@ -148,7 +148,13 @@ describe("ask_grokbot", () => {
     env.ASK_DAILY_LIMIT = "1";
     const sent = captureWebhook(500);
     const out = await tool("ask_grokbot", { message: "hi", wait_seconds: 0 });
-    expect(out).toMatchObject({ ok: false, error: "webhook_failed", webhook_status: 500 });
+    expect(out).toMatchObject({
+      ok: false,
+      error: "webhook_failed",
+      webhook_status: 500,
+      status: "pending",
+      run_id: expect.any(String),
+    });
     expect(sent).toHaveLength(1);
     expect((await storedRun(out.run_id))?.status).toBe("pending");
     expect(await tool("ask_grokbot", { message: "again", wait_seconds: 0 })).toMatchObject({ error: "daily_limit_reached" });

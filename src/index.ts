@@ -121,10 +121,18 @@ function createServer(env: Env, cfg: Config, baseUrl: string) {
         const clientError = webhookStatus !== null && webhookStatus >= 400 && webhookStatus < 500;
         const serverError = webhookStatus !== null && webhookStatus >= 500;
         // 5xx は routine が既に始まっていることがある。再送せず pending のまま残し、遅れた callback を受ける。
-        // 4xx は未受理なので取り消し、枠を戻す。タイムアウト・通信断（status なし）は従来どおり取り消す。枠は戻さない。
+        // 応答に status: "pending" と run_id を載せ、失敗を終端と読ませない。
+        // 4xx は未受理なので取り消し、枠を戻す。タイムアウト・通信断（status なし）は従来どおり取り消す。枠は戻さない。応答に status は付けない。
         if (!serverError) await stub.cancel();
         if (clientError) await budget.refund();
-        return result({ ok: false, error: "webhook_failed", webhook_status: webhookStatus, run_id: runId, detail: String(err) });
+        return result({
+          ok: false,
+          error: "webhook_failed",
+          webhook_status: webhookStatus,
+          run_id: runId,
+          ...(serverError ? { status: "pending" } : {}),
+          detail: String(err),
+        });
       }
 
       const rec = await stub.wait(capWait(cfg, wait_seconds) * 1000);
