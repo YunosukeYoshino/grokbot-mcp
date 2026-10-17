@@ -2,3 +2,6 @@ node_modules
 .wrangler
 .dev.vars
 .secrets.env
+# verification scaffolding runtime and captured evidence
+.cursor/skills/verify-grokbot-mcp/runtime/
+.cursor/skills/verify-grokbot-mcp/evidence/
