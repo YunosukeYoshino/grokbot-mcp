@@ -154,7 +154,7 @@ Copy `.dev.vars.example` to `.dev.vars`, fill in the values, and run `bun run de
 | `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | Single wait, deadline for the answer, retention after finish (0 = keep forever) | vars |
 
 - Limits are counted exactly in a single DO, `Budget("global")`. A rejected ask creates neither a webhook call nor a Run DO.
-- An ask whose webhook returned 4xx was not accepted, so its slot is refunded. 5xx, timeouts (10 s) and connection drops may have been processed on the other side, so they are not refunded.
+- An ask whose webhook returned 4xx was not accepted, so its slot is refunded and the run is cancelled. A 5xx may mean the routine already started, so the Worker does not send a second webhook and leaves the run pending; a later callback can still store the answer, and the slot is not refunded. Timeouts (10 s) and connection drops still cancel the run and are not refunded.
 - If a var is not a valid number, `/mcp` and callbacks return 503 `misconfigured` (the service never runs with limits disabled).
 
 - Remaining worst case (estimate): even if the daily limit is used up every day at maximum wait, the DOs stay around 800 requests and 4,500 GB-s per day, within the Free daily allowance and the Paid monthly free allowance. Grok Bot / Cursor usage is capped at `ASK_DAILY_LIMIT` per day.
