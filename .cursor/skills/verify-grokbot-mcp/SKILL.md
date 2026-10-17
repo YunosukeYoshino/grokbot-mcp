@@ -63,7 +63,7 @@ Drive the running server with curl. Tool results are `text/event-stream`: one `d
 
 | Route | Method | Auth | Observed result |
 | --- | --- | --- | --- |
-| `/mcp` | POST | bearer or `X-API-Key` | `200` SSE for a listed or called tool; `401` `{"error":"unauthorized"}` without the key; `429` `{"error":"rate_limited"}` past 60/min; `503` when the key or a numeric var is missing |
+| `/mcp` | POST | bearer or `X-API-Key` | `200` SSE for a listed or called tool; `401` `{"error":"unauthorized"}` without the key; `429` `{"error":"rate_limited"}` past 60/min; `503` `{"error":"mcp_api_key_not_configured"}` when the key is empty; `503` `{"error":"misconfigured"}` when `readConfig` rejects the vars |
 | `/callbacks/{run_id}/{token}` | POST | HMAC token in the path | `200` `{"ok":true,"run_id":...}` the first time a pending run is answered |
 | anything else | GET or POST | none | `404` `{"error":"not_found"}`. `GET /mcp` is `405` |
 

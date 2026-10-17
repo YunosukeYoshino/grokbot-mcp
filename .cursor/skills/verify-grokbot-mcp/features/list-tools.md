@@ -39,7 +39,7 @@ The passing body is `text/event-stream` with a `data:` line whose `result.tools`
 
 - Connection refused means launch did not become ready. The journey fails.
 - HTTP `503` `{"error":"mcp_api_key_not_configured"}` means `.dev.vars` has no `MCP_API_KEY`. Do not treat `503` as a successful list.
-- HTTP `503` `{"error":"misconfigured"}` means a numeric var failed validation. Listing tools is blocked until the var is a valid number.
+- HTTP `503` `{"error":"misconfigured"}` means `readConfig` rejected the vars (`src/config.ts`). A limit is not an integer in range, or `COST_KILL_SWITCH` is not `0` or `1`. With a valid key, listing tools is blocked until the vars pass. A request with no key is `401` before that check.
 - HTTP `429` `{"error":"rate_limited"}` means the location limiter (60 requests per minute on `/mcp`) tripped. That is not a successful list.
 - `GET /mcp` returns `405`. The client POST is the journey.
 - The response is SSE, not a bare JSON document. A check that only runs `jq` on the raw body fails for that reason.
