@@ -144,13 +144,29 @@ describe("ask_grokbot", () => {
     expect(out).toMatchObject({ ok: true, run_id, status: "answered", answer_text: "42" });
   });
 
-  it("reports webhook failure, cancels the run and keeps the budget spent on 5xx", async () => {
+  it("reports webhook failure on 5xx, leaves the run pending for a late callback, and keeps the budget spent", async () => {
     env.ASK_DAILY_LIMIT = "1";
-    captureWebhook(500);
+    const sent = captureWebhook(500);
     const out = await tool("ask_grokbot", { message: "hi", wait_seconds: 0 });
-    expect(out).toMatchObject({ ok: false, error: "webhook_failed", webhook_status: 500 });
-    expect((await storedRun(out.run_id))?.status).toBe("cancelled");
-    expect(await tool("ask_grokbot", { message: "hi", wait_seconds: 0 })).toMatchObject({ error: "daily_limit_reached" });
+    expect(out).toMatchObject({
+      ok: false,
+      error: "webhook_failed",
+      webhook_status: 500,
+      status: "pending",
+      run_id: expect.any(String),
+    });
+    expect(sent).toHaveLength(1);
+    expect((await storedRun(out.run_id))?.status).toBe("pending");
+    expect(await tool("ask_grokbot", { message: "again", wait_seconds: 0 })).toMatchObject({ error: "daily_limit_reached" });
+    expect(sent).toHaveLength(1);
+
+    vi.restoreAllMocks();
+    const cb = await postCallback(sent[0].body.callback_url, { ok: true, answer: "late", run_id: out.run_id });
+    expect(cb.status).toBe(200);
+    expect(await tool("get_grokbot_run", { run_id: out.run_id })).toMatchObject({
+      status: "answered",
+      answer_text: "late",
+    });
   });
 
   it("refunds the budget when the webhook rejects with 4xx", async () => {

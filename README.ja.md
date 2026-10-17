@@ -152,7 +152,7 @@ curl -s https://<worker>.workers.dev/mcp \
 | `MAX_WAIT_SECONDS` / `CALLBACK_TTL_SECONDS` / `RUN_RETENTION_SECONDS` | 1 回の待機時間、回答待ちの期限、終了後の保存期間（0 = 削除しない） | vars |
 
 - 上限は単一 DO `Budget("global")` で正確にカウントする。拒否された ask は webhook も Run DO も作らない。
-- webhook が 4xx を返した ask は受理されていないので枠を戻す。5xx・タイムアウト（10 秒）・通信断は相手側で処理された可能性があるので戻さない。
+- webhook が 4xx を返した ask は受理されていないので枠を戻し、run は取り消す。5xx は routine が既に始まっていることがあるので再送せず、run は pending のまま残す（遅れた callback は回答として保存する）。枠は戻さない。タイムアウト（10 秒）と通信断は従来どおり run を取り消し、枠は戻さない。
 - vars が数値として不正なら `/mcp` と callback は 503 `misconfigured` を返す（上限が効かない状態で動かさない）。
 
 - 残る最悪ケース（推定）: 日次上限を毎日最大待機で使い切っても、DO は約 800 リクエスト・約 4,500 GB-s / 日で、Free の日次枠・Paid の月間無料枠に収まる。Grok Bot / Cursor 側の利用量は `ASK_DAILY_LIMIT` 件/日が上限になる。
