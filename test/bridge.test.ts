@@ -3,12 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { callbackToken } from "../src/index";
 import { extractAnswerText, type RunRecord } from "../src/run";
 
-const BASE = "https://bridge.test";
+let BASE = "https://bridge.test";
 const ctx = { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext;
 
 function call(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   if (!headers.has("cf-connecting-ip")) headers.set("cf-connecting-ip", "192.0.2.1");
+  if (!headers.has("host")) headers.set("host", new URL(BASE).host);
   return worker.fetch(new Request(BASE + path, { ...init, headers }) as Request<unknown, IncomingRequestCfProperties>, env, ctx);
 }
 
@@ -86,7 +87,7 @@ async function pkceChallenge(verifier: string) {
   return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
 }
 
-async function registerOAuthClient(redirectUris = ["https://client.test/callback"]) {
+async function registerOAuthClient(redirectUris = ["https://client.test/callback"], tokenEndpointAuthMethod = "none") {
   const response = await call("/oauth/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -95,11 +96,11 @@ async function registerOAuthClient(redirectUris = ["https://client.test/callback
       redirect_uris: redirectUris,
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method: "none",
+      token_endpoint_auth_method: tokenEndpointAuthMethod,
     }),
   });
   expect(response.status).toBe(201);
-  return (await response.json()) as { client_id: string };
+  return (await response.json()) as { client_id: string; client_secret?: string };
 }
 
 async function beginGitHubOAuth(options: {
@@ -108,11 +109,12 @@ async function beginGitHubOAuth(options: {
   scope?: string;
   resource?: string;
   decision?: "approve" | "deny";
+  tokenEndpointAuthMethod?: "none" | "client_secret_basic";
 } = {}) {
   const resource = options.resource ?? `${BASE}/mcp`;
   const registeredRedirectUri = options.registeredRedirectUri ?? "https://client.test/callback";
   const redirectUri = options.redirectUri ?? registeredRedirectUri;
-  const client = await registerOAuthClient([registeredRedirectUri]);
+  const client = await registerOAuthClient([registeredRedirectUri], options.tokenEndpointAuthMethod);
   const cookies = new Map<string, string>();
   const verifier = base64Url(crypto.getRandomValues(new Uint8Array(32)));
   const challenge = await pkceChallenge(verifier);
@@ -209,11 +211,12 @@ async function completeGitHubOAuth(githubId: number, options: Parameters<typeof 
     resource: options.tokenResource ?? resource,
   });
   if (options.deferTokenExchange) return { githubCallback, calls, tokenExchange, client, verifier, resource, redirectUri };
-  const tokenResponse = await call("/oauth/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: tokenExchange,
-  });
+  const tokenHeaders: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+  if (client.client_secret) {
+    tokenExchange.delete("client_id");
+    tokenHeaders.authorization = `Basic ${btoa(`${encodeURIComponent(client.client_id)}:${encodeURIComponent(client.client_secret)}`)}`;
+  }
+  const tokenResponse = await call("/oauth/token", { method: "POST", headers: tokenHeaders, body: tokenExchange });
   if (!tokenResponse.ok) return { githubCallback, calls, tokenResponse, tokenExchange };
   expect(tokenResponse.status).toBe(200);
   const token = (await tokenResponse.json()) as { access_token: string };
@@ -334,6 +337,36 @@ describe("GitHub OAuth", () => {
     expect(calls).toEqual(["https://github.com/login/oauth/access_token", "https://api.github.com/user"]);
     expect(mcpResponse?.status).toBe(200);
     expect(await mcpResponse?.text()).toContain("ask_grokbot");
+  });
+
+  it("lets a client_secret_basic client on a foreign browser Origin initialize and list tools on workers.dev", async () => {
+    // workers.dev ホストでだけ agents の既定 Origin 検証が有効になるので、本番と同じホスト名で通す
+    const saved = BASE;
+    BASE = "https://grokbot-bridge.yunosuke.workers.dev";
+    env.PUBLIC_BASE_URL = BASE;
+    // OAuthProvider は最初の呼び出しで helper を env にキャッシュし、その時点の resource に縛られるため、ホスト切替の前後で捨てる
+    const cachedEnv = env as typeof env & { OAUTH_PROVIDER?: unknown };
+    delete cachedEnv.OAUTH_PROVIDER;
+    try {
+      const { tokenResponse, token } = await completeGitHubOAuth(Number(env.GITHUB_OWNER_ID), { tokenEndpointAuthMethod: "client_secret_basic" });
+      expect(tokenResponse?.status).toBe(200);
+      const auth = { authorization: `Bearer ${token!.access_token}`, origin: "https://client.test" };
+      const initialize = await mcp("initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "browser-test-client", version: "1.0.0" },
+      }, auth);
+      expect(initialize.status).toBe(200);
+      const tools = await mcp("tools/list", {}, auth);
+      expect(tools.status).toBe(200);
+      expect(await tools.text()).toContain("ask_grokbot");
+
+      expect((await mcp("tools/list", {}, { origin: "https://client.test" })).status).toBe(401);
+      expect((await mcp("tools/list", {}, { authorization: "Bearer never-issued-token", origin: "https://client.test" })).status).toBe(401);
+    } finally {
+      BASE = saved;
+      delete cachedEnv.OAUTH_PROVIDER;
+    }
   });
 
   it("rejects another GitHub ID before issuing an MCP authorization code", async () => {

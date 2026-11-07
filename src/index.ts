@@ -201,7 +201,9 @@ const serveMcp: ServeMcp = async (request, env, ctx, baseUrl) => {
   if (!(await env.MCP_RATE_LIMITER.limit({ key: "mcp" })).success) return json({ error: "rate_limited" }, 429);
   const cfg = readConfig(env);
   if (!cfg) return json({ error: "misconfigured" }, 503);
-  return createMcpHandler(() => createServer(env, cfg, baseUrl))(request, env, ctx);
+  // ここに来るのは OAuthProvider が Bearer（OAuth トークン or MCP_API_KEY）を検証済みのリクエストだけ。
+  // cookie などの ambient な資格情報は使わないので、ブラウザ型 MCP クライアントの外部 Origin も通す（workers.dev の既定は自ホストのみで 403）
+  return createMcpHandler(() => createServer(env, cfg, baseUrl), { allowedOriginHostnames: "*" })(request, env, ctx);
 };
 
 export default {
